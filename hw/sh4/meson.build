@@ -5,5 +5,6 @@ sh4_ss.add(when: 'CONFIG_SH7750', if_true: files(
 ))
 sh4_ss.add(when: 'CONFIG_SH7764', if_true: files('sh7764.c'))
 sh4_ss.add(when: 'CONFIG_R2D', if_true: files('r2d.c'))
+sh4_ss.add(when: 'CONFIG_CDJ2KNXS', if_true: files('cdj2knxs.c'))
 
 hw_arch += {'sh4': sh4_ss}

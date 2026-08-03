@@ -24,3 +24,10 @@ config SH7764
     select SH_INTC
     select SH_SCI
     select SH_TIMER
+
+config CDJ2KNXS
+    bool
+    default y
+    depends on SH4
+    select SH7764
+    select UNIMP
