@@ -186,6 +186,14 @@ void superh_cpu_do_interrupt(CPUState *cs)
 
     if (do_irq) {
         env->intevt = irq_vector;
+        if (env->cpuopm & CPUOPM_INTMU) {
+            /*
+             * SH-4A: with CPUOPM.INTMU set the CPU loads SR.IMASK with the
+             * level of the accepted interrupt, so a handler cannot be
+             * re-entered by the very source it has not acknowledged yet.
+             */
+            env->sr = deposit32(env->sr, SR_I0, 4, irq_priority);
+        }
         env->pc = env->vbr + 0x600;
         qemu_plugin_vcpu_interrupt_cb(cs, last_pc);
         return;

@@ -140,6 +140,7 @@ static void superh_cpu_reset_hold(Object *obj, ResetType type)
     memset(env, 0, offsetof(CPUSH4State, end_reset_fields));
 
     env->pc = 0xA0000000;
+    env->cpuopm = CPUOPM_RESET;
 #if defined(CONFIG_USER_ONLY)
     env->fpscr = FPSCR_PR; /* value for userspace according to the kernel */
     set_float_rounding_mode(float_round_nearest_even, &env->fp_status); /* ?! */

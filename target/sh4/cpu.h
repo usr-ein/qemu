@@ -50,6 +50,15 @@
 #define SR_S  1
 #define SR_T  0
 
+/*
+ * CPU operation mode register, appendix A of the SH7764 hardware manual.
+ * INTMU makes the CPU load SR.IMASK with the priority of an accepted
+ * interrupt, so a handler is not immediately re-entered by the source it has
+ * not acknowledged yet.
+ */
+#define CPUOPM_RESET  0x000003c0
+#define CPUOPM_INTMU  (1u << 3)
+
 #define FPSCR_MASK             (0x003fffff)
 #define FPSCR_FR               (1 << 21)
 #define FPSCR_SZ               (1 << 20)
@@ -144,6 +153,7 @@ typedef struct CPUArchState {
     uint32_t gregs[24];         /* general registers */
     float32 fregs[32];          /* floating point registers */
     uint32_t sr;                /* status register (with T split out) */
+    uint32_t cpuopm;            /* CPU operation mode register (SH-4A) */
     uint32_t sr_m;              /* M bit of status register */
     uint32_t sr_q;              /* Q bit of status register */
     uint32_t sr_t;              /* T bit of status register */
