@@ -235,6 +235,32 @@ static void sh7785_cpu_initfn(Object *obj)
     env->features = SH_FEATURE_SH4A;
 }
 
+static void sh7764_class_init(ObjectClass *oc, const void *data)
+{
+    SuperHCPUClass *scc = SUPERH_CPU_CLASS(oc);
+
+    /*
+     * SH7764 group, parts SH77641 (R5S77641) and SH77640 (R5S77640).
+     * PVR and PRR are from appendix D of the SH7764 hardware manual
+     * (R01UH0360EJ0300): PVR CHIP = H'10 (SH-4A family), VER = H'30,
+     * CUT = H'08; PRR product = H'10 in bits 15 to 8. The low bits of both
+     * are documented as undefined and to be masked by software.
+     *
+     * CVR is not documented for this part, so it is left at the reset value
+     * rather than invented.
+     */
+    scc->pvr = 0x10300800;
+    scc->prr = 0x00001000;
+}
+
+static void sh7764_cpu_initfn(Object *obj)
+{
+    CPUSH4State *env = cpu_env(CPU(obj));
+
+    env->id = SH_CPU_SH7764;
+    env->features = SH_FEATURE_SH4A;
+}
+
 static void sh7785_class_init(ObjectClass *oc, const void *data)
 {
     SuperHCPUClass *scc = SUPERH_CPU_CLASS(oc);
@@ -357,6 +383,8 @@ static const TypeInfo superh_cpu_type_infos[] = {
                            sh7750r_cpu_initfn),
     DEFINE_SUPERH_CPU_TYPE(TYPE_SH7751R_CPU, sh7751r_class_init,
                            sh7751r_cpu_initfn),
+    DEFINE_SUPERH_CPU_TYPE(TYPE_SH7764_CPU, sh7764_class_init,
+                           sh7764_cpu_initfn),
     DEFINE_SUPERH_CPU_TYPE(TYPE_SH7785_CPU, sh7785_class_init,
                            sh7785_cpu_initfn),
 
