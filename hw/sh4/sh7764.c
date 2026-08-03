@@ -201,7 +201,6 @@ static uint64_t sh7764_ccn_read(void *opaque, hwaddr offset, unsigned size)
     SH7764State *s = opaque;
     CPUSH4State *env = &s->cpu->env;
 
-    trace_sh7764_ccn_read(offset, 0);
     switch (offset) {
     case SH7764_CCN_PTEH:
         return env->pteh;
@@ -218,6 +217,7 @@ static uint64_t sh7764_ccn_read(void *opaque, hwaddr offset, unsigned size)
     case SH7764_CCN_EXPEVT:
         return env->expevt;
     case SH7764_CCN_INTEVT:
+        trace_sh7764_ccn_read(offset, env->intevt);
         return env->intevt;
     case SH7764_CCN_PVR:
         return SUPERH_CPU_GET_CLASS(s->cpu)->pvr;
@@ -346,6 +346,40 @@ static const MemoryRegionOps sh7764_wdt_ops = {
     .write = sh7764_wdt_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+/* --------------------------------------------------------------- CPUOPM */
+
+/*
+ * CPU operation mode register (appendix A of the hardware manual). The only
+ * bit that matters to us is INTMU: with it set, an accepted interrupt loads
+ * its priority into SR.IMASK, which is what stops a handler being re-entered
+ * by a source it has not acknowledged yet. It lives in the CPU rather than
+ * this device, so the register just forwards to it.
+ */
+static uint64_t sh7764_cpuopm_read(void *opaque, hwaddr offset, unsigned size)
+{
+    SH7764State *s = opaque;
+
+    return offset == 0 ? s->cpu->env.cpuopm : 0;
+}
+
+static void sh7764_cpuopm_write(void *opaque, hwaddr offset, uint64_t value,
+                                unsigned size)
+{
+    SH7764State *s = opaque;
+
+    if (offset == 0) {
+        s->cpu->env.cpuopm = value;
+    }
+}
+
+static const MemoryRegionOps sh7764_cpuopm_ops = {
+    .read = sh7764_cpuopm_read,
+    .write = sh7764_cpuopm_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 4,
     .valid.max_access_size = 4,
 };
 
@@ -485,12 +519,13 @@ static struct intc_mask_reg sh7764_mask_registers[] = {
       { 0, 0, 0, 0, 0, 0, 0, 0,                 /* 31..24 */
         0, 0, 0, 0, 0, 0, 0, 0,                 /* 23..16 */
         0, 0, 0, 0, 0, 0, 0, 0,                 /* 15..8  */
-        0, 0, WDT_ITI, SCIF0, 0, 0, TUNI1, TUNI0 } },   /* 7..0 */
+        0, 0, WDT_ITI, SCIF0, 0, 0, TUNI1, TUNI0 },     /* 7..0 */
+      0, true },
     { 0xffd400d4, 0xffd400d0, 32, /* INT2MSKCR1 / INT2MSKR1 */
       { 0, 0, 0, 0, 0, 0, SCIF2, 0,             /* 31..24 */
         0, 0, 0, 0, 0, 0, 0, 0,                 /* 23..16 */
         0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0 } },
+        0, 0, 0, 0, 0, 0, 0, 0 }, 0, true },
 };
 
 /* ----------------------------------------------------------------- QOM */
@@ -532,8 +567,9 @@ static void sh7764_realize(DeviceState *dev, Error **errp)
                      SH7764_ATAPI_BASE, SH7764_ATAPI_SIZE);
     sh7764_bank_init(s, &s->misc_a, "sh7764.misc-ffa0",
                      SH7764_MISC_A_BASE, SH7764_MISC_A_SIZE);
-    sh7764_bank_init(s, &s->misc_b, "sh7764.misc-ff2f",
-                     SH7764_MISC_B_BASE, SH7764_MISC_B_SIZE);
+    memory_region_init_io(&s->cpuopm, OBJECT(s), &sh7764_cpuopm_ops, s,
+                          "sh7764.cpuopm", SH7764_CPUOPM_SIZE);
+    memory_region_add_subregion(sysmem, SH7764_CPUOPM_BASE, &s->cpuopm);
 
     sh_intc_init(sysmem, &s->intc, NR_INTC_SOURCES,
                  _INTC_ARRAY(sh7764_mask_registers),

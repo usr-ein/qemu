@@ -61,8 +61,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(SH7764State, SH7764)
  */
 #define SH7764_MISC_A_BASE      0xffa00000
 #define SH7764_MISC_A_SIZE      0x00001000
-#define SH7764_MISC_B_BASE      0xff2f0000
-#define SH7764_MISC_B_SIZE      0x00001000
+/*
+ * CPU operation mode register, appendix A of the hardware manual. INTMU
+ * (bit 3) makes an accepted interrupt load its priority into SR.IMASK.
+ */
+#define SH7764_CPUOPM_BASE      0xff2f0000
+#define SH7764_CPUOPM_SIZE      0x00001000
 
 /* CCN register offsets (SH-4 architectural). */
 #define SH7764_CCN_PTEH         0x00
@@ -125,6 +129,7 @@ struct SH7764State {
     MemoryRegion ccn;
     MemoryRegion dmac;
     MemoryRegion wdt;
+    MemoryRegion cpuopm;
 
     struct intc_desc intc;
     uint32_t periph_freq;
@@ -135,7 +140,6 @@ struct SH7764State {
     SH7764RegBank ssi_b;
     SH7764RegBank atapi;
     SH7764RegBank misc_a;
-    SH7764RegBank misc_b;
 
     /* DMAC state */
     uint32_t dmaor;
