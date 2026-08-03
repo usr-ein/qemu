@@ -13,6 +13,8 @@
 #include "system/memory.h"
 /* The SoC embeds the CPU object, so the full type is needed, not just QOM. */
 #include "target/bfin/cpu.h"
+#include "hw/dma/bfin_dma.h"
+#include "hw/display/bfin_ppi.h"
 #include "qom/object.h"
 
 #define TYPE_BF531 "bf531"
@@ -89,6 +91,8 @@ struct BF531State {
 
     /*< public >*/
     ArchCPU cpu;
+    BfinDMAState dma;
+    BfinPPIState ppi;
 
     MemoryRegion *sysmem;
     MemoryRegion sdram;

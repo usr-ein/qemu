@@ -2,6 +2,8 @@
 config BF531
     bool
     select UNIMP
+    select BFIN_DMA
+    select BFIN_PPI
 
 config CDJ2KNXS_GUI
     bool

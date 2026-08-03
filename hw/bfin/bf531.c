@@ -176,8 +176,6 @@ static void bf531_realize(DeviceState *dev, Error **errp)
             { BF531_SPORT1_BASE, "bf531.sport1" },
             { BF531_EBIU_BASE,   "bf531.ebiu" },
             { BF531_DMA_TC_BASE, "bf531.dma-tc" },
-            { BF531_DMA_BASE,    "bf531.dma" },
-            { BF531_PPI_BASE,    "bf531.ppi" },
         };
 
         for (i = 0; i < ARRAY_SIZE(pages); i++) {
@@ -187,6 +185,27 @@ static void bf531_realize(DeviceState *dev, Error **errp)
         create_unimplemented_device("bf531.sys-mmr", BF531_SYS_MMR_BASE,
                                     BF531_SYS_MMR_SIZE);
     }
+
+    /*
+     * DMA and the PPI are modelled, because between them they are the panel:
+     * the PPI is the parallel port that clocks pixels out, and a DMA channel
+     * streams the frame buffer into it.
+     */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->dma), errp)) {
+        return;
+    }
+    memory_region_add_subregion(sysmem, BF531_DMA_BASE,
+                                sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->dma),
+                                                       0));
+
+    object_property_set_link(OBJECT(&s->ppi), "dma", OBJECT(&s->dma),
+                             &error_abort);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->ppi), errp)) {
+        return;
+    }
+    memory_region_add_subregion(sysmem, BF531_PPI_BASE,
+                                sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->ppi),
+                                                       0));
 
     for (i = 0; i < BF531_ASYNC_BANKS; i++) {
         g_autofree char *name = g_strdup_printf("bf531.async-bank%u", i);
@@ -202,6 +221,8 @@ static void bf531_init(Object *obj)
     BF531State *s = BF531(obj);
 
     object_initialize_child(obj, "cpu", &s->cpu, TYPE_BF531_CPU);
+    object_initialize_child(obj, "dma", &s->dma, TYPE_BFIN_DMA);
+    object_initialize_child(obj, "ppi", &s->ppi, TYPE_BFIN_PPI);
 }
 
 static const Property bf531_properties[] = {
