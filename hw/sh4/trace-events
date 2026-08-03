@@ -1,3 +1,13 @@
 # sh7750.c
 sh7750_porta(uint16_t prev, uint16_t cur, uint16_t pdtr, uint16_t pctr) "porta changed from 0x%04x to 0x%04x (pdtra=0x%04x, pctra=0x%08x)"
 sh7750_portb(uint16_t prev, uint16_t cur, uint16_t pdtr, uint16_t pctr) "portb changed from 0x%04x to 0x%04x (pdtrb=0x%04x, pctrb=0x%08x)"
+
+# sh7764.c
+sh7764_dma_run(int ch, uint64_t src, uint64_t dst, uint64_t len, unsigned unit) "ch%d 0x%08" PRIx64 " -> 0x%08" PRIx64 " %" PRId64 " bytes (unit %u)"
+sh7764_ccn_read(uint64_t off, uint64_t val) "CCN rd +0x%03" PRIx64 " -> 0x%08" PRIx64
+sh7764_ccn_write(uint64_t off, uint64_t val) "CCN WR +0x%03" PRIx64 " <- 0x%08" PRIx64
+sh7764_wdt_write(uint64_t off, uint64_t val) "WDT WR +0x%03" PRIx64 " <- 0x%08" PRIx64
+sh7764_bank_read(const char *n, uint64_t off, uint64_t val, unsigned sz) "%s rd +0x%03" PRIx64 " -> 0x%08" PRIx64 " (%u)"
+sh7764_bank_write(const char *n, uint64_t off, uint64_t val, unsigned sz) "%s WR +0x%03" PRIx64 " <- 0x%08" PRIx64 " (%u)"
+sh7764_dmac_read(uint64_t off, uint64_t val) "DMAC rd +0x%03" PRIx64 " -> 0x%08" PRIx64
+sh7764_dmac_write(uint64_t off, uint64_t val) "DMAC WR +0x%03" PRIx64 " <- 0x%08" PRIx64
