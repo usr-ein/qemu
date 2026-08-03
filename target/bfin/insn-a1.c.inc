@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /* ---------------------------------------------------------------- */
 /* Half word and byte access through a pointer                      */
 

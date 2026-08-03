@@ -363,3 +363,5 @@ uint32_t HELPER(bitextract)(uint32_t scene, uint32_t pattern, uint32_t sign)
     }
     return field;
 }
+
+#include "helper-mac.c.inc"

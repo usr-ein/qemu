@@ -448,13 +448,6 @@ static bool trans_ldimm_p7(DisasContext *ctx, arg_ldimm_p7 *a)
     return true;
 }
 
-static bool trans_addimm_d7(DisasContext *ctx, arg_addimm_d7 *a)
-{
-    tcg_gen_addi_i32(dreg(a->rd), dreg(a->rd), a->imm);
-    gen_logic_flags(dreg(a->rd));
-    return true;
-}
-
 static bool trans_addimm_p7(DisasContext *ctx, arg_addimm_p7 *a)
 {
     /* Pointer arithmetic does not touch the arithmetic status bits. */
@@ -583,21 +576,29 @@ static bool trans_stw_p_off_d(DisasContext *ctx, arg_stw_p_off_d *a)
 static void gen_load_pm(TCGv dst, TCGv ptr, int delta, MemOp op)
 {
     TCGv addr = tcg_temp_new_i32();
+    TCGv val = tcg_temp_new_i32();
 
+    /* The pointer update follows the access; see gen_store_pm. */
     tcg_gen_mov_i32(addr, ptr);
+    tcg_gen_qemu_ld_i32(val, addr, 0, op);
     tcg_gen_addi_i32(ptr, ptr, delta);
-    tcg_gen_qemu_ld_i32(dst, addr, 0, op);
+    tcg_gen_mov_i32(dst, val);
 }
 
 static void gen_store_pm(TCGv src, TCGv ptr, int delta, MemOp op)
 {
     TCGv addr = tcg_temp_new_i32();
-    TCGv val = tcg_temp_new_i32();
 
+    /*
+     * The pointer update has to follow the access, not precede it. An access
+     * to a device rather than to RAM makes QEMU rewind the block and execute
+     * it again, and the pointer is a global, so an update made before the
+     * access is applied twice: the pointer advances by two elements per pass
+     * and every other store goes missing.
+     */
     tcg_gen_mov_i32(addr, ptr);
-    tcg_gen_mov_i32(val, src);
+    tcg_gen_qemu_st_i32(src, addr, 0, op);
     tcg_gen_addi_i32(ptr, ptr, delta);
-    tcg_gen_qemu_st_i32(val, addr, 0, op);
 }
 
 static bool trans_ld_d_pp(DisasContext *ctx, arg_ld_d_pp *a)
@@ -658,10 +659,10 @@ static void gen_indexed_load(int rd_gpr, int pb, int pi, MemOp op, bool half_hi)
     TCGv addr = tcg_temp_new_i32();
 
     tcg_gen_mov_i32(addr, preg(pb));
+    tcg_gen_qemu_ld_i32(cpu_gpr[rd_gpr], addr, 0, op);
     if (pb != pi) {
         tcg_gen_add_i32(preg(pb), preg(pb), preg(pi));
     }
-    tcg_gen_qemu_ld_i32(cpu_gpr[rd_gpr], addr, 0, op);
 }
 
 static void gen_indexed_store(TCGv src, int pb, int pi, MemOp op)
@@ -671,10 +672,10 @@ static void gen_indexed_store(TCGv src, int pb, int pi, MemOp op)
 
     tcg_gen_mov_i32(addr, preg(pb));
     tcg_gen_mov_i32(val, src);
+    tcg_gen_qemu_st_i32(val, addr, 0, op);
     if (pb != pi) {
         tcg_gen_add_i32(preg(pb), preg(pb), preg(pi));
     }
-    tcg_gen_qemu_st_i32(val, addr, 0, op);
 }
 
 static bool trans_ldw_pi_d_z(DisasContext *ctx, arg_ldw_pi_d_z *a)
@@ -831,41 +832,6 @@ static bool trans_unlink(DisasContext *ctx, arg_unlink *a)
 /* ---------------------------------------------------------------- */
 /* Arithmetic and logic                                             */
 
-static bool trans_add_d_d(DisasContext *ctx, arg_add_d_d *a)
-{
-    tcg_gen_add_i32(dreg(a->dst), dreg(a->src1), dreg(a->src2));
-    gen_logic_flags(dreg(a->dst));
-    return true;
-}
-
-static bool trans_sub_d_d(DisasContext *ctx, arg_sub_d_d *a)
-{
-    tcg_gen_sub_i32(dreg(a->dst), dreg(a->src1), dreg(a->src2));
-    gen_logic_flags(dreg(a->dst));
-    return true;
-}
-
-static bool trans_and_d_d(DisasContext *ctx, arg_and_d_d *a)
-{
-    tcg_gen_and_i32(dreg(a->dst), dreg(a->src1), dreg(a->src2));
-    gen_logic_flags(dreg(a->dst));
-    return true;
-}
-
-static bool trans_or_d_d(DisasContext *ctx, arg_or_d_d *a)
-{
-    tcg_gen_or_i32(dreg(a->dst), dreg(a->src1), dreg(a->src2));
-    gen_logic_flags(dreg(a->dst));
-    return true;
-}
-
-static bool trans_xor_d_d(DisasContext *ctx, arg_xor_d_d *a)
-{
-    tcg_gen_xor_i32(dreg(a->dst), dreg(a->src1), dreg(a->src2));
-    gen_logic_flags(dreg(a->dst));
-    return true;
-}
-
 static bool gen_bittst(DisasContext *ctx, int rd, int imm, bool want)
 {
     TCGv t = tcg_temp_new_i32();
@@ -883,64 +849,6 @@ static bool trans_bittst(DisasContext *ctx, arg_bittst *a)
 static bool trans_bittst_n(DisasContext *ctx, arg_bittst_n *a)
 {
     return gen_bittst(ctx, a->rd, a->imm, false);
-}
-
-static bool trans_bitset(DisasContext *ctx, arg_bitset *a)
-{
-    tcg_gen_ori_i32(dreg(a->rd), dreg(a->rd), 1u << a->imm);
-    gen_logic_flags(dreg(a->rd));
-    return true;
-}
-
-static bool trans_bitclr(DisasContext *ctx, arg_bitclr *a)
-{
-    tcg_gen_andi_i32(dreg(a->rd), dreg(a->rd), ~(1u << a->imm));
-    gen_logic_flags(dreg(a->rd));
-    return true;
-}
-
-static bool trans_bittgl(DisasContext *ctx, arg_bittgl *a)
-{
-    tcg_gen_xori_i32(dreg(a->rd), dreg(a->rd), 1u << a->imm);
-    gen_logic_flags(dreg(a->rd));
-    return true;
-}
-
-static bool trans_asr_imm(DisasContext *ctx, arg_asr_imm *a)
-{
-    tcg_gen_sari_i32(dreg(a->rd), dreg(a->rd), a->imm);
-    gen_logic_flags(dreg(a->rd));
-    return true;
-}
-
-static bool trans_lsr_imm(DisasContext *ctx, arg_lsr_imm *a)
-{
-    tcg_gen_shri_i32(dreg(a->rd), dreg(a->rd), a->imm);
-    gen_logic_flags(dreg(a->rd));
-    return true;
-}
-
-static bool trans_lsl_imm(DisasContext *ctx, arg_lsl_imm *a)
-{
-    tcg_gen_shli_i32(dreg(a->rd), dreg(a->rd), a->imm);
-    gen_logic_flags(dreg(a->rd));
-    return true;
-}
-
-static bool trans_shl_p1(DisasContext *ctx, arg_shl_p1 *a)
-{
-    /* Preg = Preg << 1, an address calculation: no status bits. */
-    tcg_gen_shli_i32(preg(a->dst), preg(a->src1), 1);
-    return true;
-}
-
-static bool trans_add_p_p2(DisasContext *ctx, arg_add_p_p2 *a)
-{
-    TCGv t = tcg_temp_new_i32();
-
-    tcg_gen_shli_i32(t, preg(a->src2), 2);
-    tcg_gen_add_i32(preg(a->dst), preg(a->src1), t);
-    return true;
 }
 
 /* ---------------------------------------------------------------- */
@@ -1097,4 +1005,6 @@ void bfin_translate_code(CPUState *cs, TranslationBlock *tb,
 #include "insn-a1.c.inc"
 #include "insn-a2.c.inc"
 #include "insn-a3.c.inc"
+#include "insn-a4.c.inc"
+#include "insn-a5.c.inc"
 /* ---- end merged instruction families ---- */

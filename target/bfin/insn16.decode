@@ -135,14 +135,14 @@ stw_p_off_d     1011 01 off:4 pb:3 rs:3
 # Arithmetic, tables C-17 and C-19
 ####
 
-add_d_d         0101 000 src2:3 src1:3 dst:3
-sub_d_d         0101 001 src2:3 src1:3 dst:3
-and_d_d         0101 010 src2:3 src1:3 dst:3
-or_d_d          0101 011 src2:3 src1:3 dst:3
-xor_d_d         0101 100 src2:3 src1:3 dst:3
+add_d_d         0101 000 dst:3 src1:3 src0:3
+sub_d_d         0101 001 dst:3 src1:3 src0:3
+and_d_d         0101 010 dst:3 src1:3 src0:3
+or_d_d          0101 011 dst:3 src1:3 src0:3
+xor_d_d         0101 100 dst:3 src1:3 src0:3
 
-shl_p1          0101 101 src2:3 src1:3 dst:3
-add_p_p2        0101 111 src2:3 src1:3 dst:3
+add_p_p         0101 101 dst:3 src1:3 src0:3
+add_p_p2        0101 111 dst:3 src1:3 src0:3
 
 ####
 # Shift and bit operations with an immediate, tables C-15 and C-16
@@ -400,4 +400,152 @@ mov_db_z        0100 0011 01 src:3 dst:3
 ####
 
 testset         0000 0000 1011 0 pb:3
+
+# from a4.decode
+# Analog Devices Blackfin ALU, shifter and bit-field encodings
+#
+# Copyright (c) 2026 cdj2knxs contributors
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Fragment for insn16.decode (the 16-bit block) and insn32.decode (the rest).
+# Encodings are from the Blackfin Processor Programming Reference rev 2.2,
+# appendix C, tables C-15 (bit operations), C-16 (shift/rotate), C-17
+# (arithmetic) and C-20 (video pixel).
+#
+# Three field layouts recur and are worth stating once, because the manual
+# names the fields differently in each and getting them crossed decodes a
+# neighbouring register silently.
+#
+#   16-bit, two operands (0x4000-0x45FF, "ALU2op"/"PTR2op"): source in bits
+#   5-3, destination in bits 2-0. The destination is also an input for the
+#   read-modify-write forms.
+#
+#   16-bit, three operands (0x5000-0x5FFF, "COMP3op"): destination in bits
+#   8-6, "Src 1" in bits 5-3, "Src 0" in bits 2-0, and the operation is
+#   dst = src0 OP src1 - so for a subtract, bits 2-0 hold the minuend.
+#   Table C-16's row for 0x5A00 disagrees (it labels bits 8-6 "Source" and
+#   both of the others "Dest"), but table C-17's row for the same opcode
+#   gives Dest/Src 1/Src 0 as above, and the encoding is decidable from the
+#   image: across the GUI firmware's 1391 0x5000-form adds the two low fields
+#   are never equal to each other while the top field equals one of them in
+#   75% of cases, which is only possible if the top field is the destination.
+#
+#   32-bit ALU (0xC4xx, "dsp32alu"): first word is 1100010 000 <HL> <aopcde>
+#   with HL selecting the destination half; second word is <aop:2> <s:1>
+#   <x:1> <dst0:3> <dst1:3> <src0:3> <src1:3>. src0 (bits 5-3) is the first
+#   operand of the syntax and src1 (bits 2-0) the second, s is the saturation
+#   flag, and for the half-word forms aop's two bits select which half each
+#   source comes from.
+
+####
+# Arithmetic and shifts with two 16-bit operands, tables C-16 and C-17
+####
+
+asr_d_d         0100 0000 00 src:3 dst:3
+lsr_d_d         0100 0000 01 src:3 dst:3
+lsl_d_d         0100 0000 10 src:3 dst:3
+
+add_sh1_d       0100 0001 00 src:3 dst:3
+add_sh2_d       0100 0001 01 src:3 dst:3
+
+divq            0100 0010 00 src:3 dst:3
+divs            0100 0010 01 src:3 dst:3
+
+neg_d           0100 0011 10 src:3 dst:3
+
+sub_p_p         0100 0100 00 src:3 dst:3
+lsl2_p          0100 0100 01 src:3 dst:3
+lsr2_p          0100 0100 11 src:3 dst:3
+lsr1_p          0100 0101 00 src:3 dst:3
+add_brev_p      0100 0101 01 src:3 dst:3
+add_sh1_p       0100 0101 10 src:3 dst:3
+add_sh2_p       0100 0101 11 src:3 dst:3
+
+# Shift with Add, table C-16. The 0x5E00 sibling is already in insn16.decode
+# as add_p_p2, but with its three register fields in the opposite order; see
+# the note at the top of this file and a4.c.inc.
+add_p_p1        0101 110 dst:3 src1:3 src0:3
+
+####
+# Index register modify, table C-17. Circular addressing is not modelled, in
+# line with the rest of the DAG support: it only applies when the matching L
+# register is nonzero and the firmware clears L0-L3 out of reset.
+####
+
+imod_i_m        1001 1110 0110 mreg:2 ireg:2
+dmod_i_m        1001 1110 0111 mreg:2 ireg:2
+imod_i_m_brev   1001 1110 1110 mreg:2 ireg:2
+
+addimm_i2       1001 1111 0110 00 ireg:2
+subimm_i2       1001 1111 0110 01 ireg:2
+addimm_i4       1001 1111 0110 10 ireg:2
+subimm_i4       1001 1111 0110 11 ireg:2
+
+# from a5.decode
+# Analog Devices Blackfin multiply, multiply-accumulate and vector encodings
+#
+# Copyright (c) 2026 cdj2knxs contributors
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Encodings are from the Blackfin Processor Programming Reference rev 2.2,
+# appendix C tables C-17 (arithmetic) and C-21 (vector operations).
+#
+# The 32-bit ALU/MAC opcode space is one encoding family. Bits 31 to 28 are
+# always 1100, bit 27 is the parallel-issue flag - set, the instruction is 64
+# bits and carries two 16-bit slots, which is not covered here - and bits 26
+# and 25 select the functional group:
+#
+#   00  multiply-accumulate (DSP32Mac)   0xC0xxxxxx
+#   01  multiply            (DSP32Mult)  0xC2xxxxxx
+#   10  ALU                 (DSP32ALU)   0xC4xxxxxx
+#   11  shifter             (DSP32Shift) 0xC6xxxxxx
+#
+# The multiply and multiply-accumulate groups share one field layout, which
+# table C-17 prints once per option value as a separate row. The fields are:
+#
+#   24:21 mmod   option select: 0 default, 1 S2RND, 2 T, 3 W32, 4 FU,
+#                6 TFU, 8 IS, 9 ISS2, 11 IH, 12 IU; the gaps are reserved
+#   20    mm     mixed multiply, MAC1 only
+#   19    p      destination is a 32-bit register, not a register half
+#   18    w1     MAC1 result is copied to a register
+#   17:16 op1    MAC1 operation: 0 "=", 1 "+=", 2 "-=", 3 unit idle
+#   15    h01    MAC1 takes operand 0 from the high half
+#   14    h11    MAC1 takes operand 1 from the high half
+#   13    w0     MAC0 result is copied to a register
+#   12:11 op0    MAC0 operation, as op1
+#   10    h00    MAC0 takes operand 0 from the high half
+#    9    h10    MAC0 takes operand 1 from the high half
+#    8:6  dst    destination register
+#    5:3  src0   operand 0 register
+#    2:0  src1   operand 1 register
+#
+# Table C-17 prints the two operand-half bits of a multiplier as one "Dreg
+# half" column and does not say which of the pair belongs to which operand.
+# The assignment above - the more significant bit of each pair selects the
+# half of operand 0 - is the one the Vector Pack row uses for its own pair of
+# half selects, and the one the GNU tools use. It is the only bit assignment
+# in this file that the manual does not state outright. Assembling
+# "R0.L = R1.H * R2.L" with any Blackfin toolchain settles it: bits 10:9 of
+# the second word read 10 if this is right and 01 if it is not.
+#
+# Patterns are one per line even where that runs long: tools/bfin_checkdecode
+# reads the file itself and does not follow decodetree line continuations, so
+# a continued pattern would silently go unchecked.
+#
+# That tool reports a disagreement for every pattern below that leaves mmod,
+# mm or the ALU option bits variable, because the manual gives one table row
+# per option value and one decodetree pattern covers the union of those rows.
+# The low opcode of each such pattern is the manual's row for the all-zero
+# option encoding, which is what makes the union checkable by eye. Sweeping
+# the opcode table confirms that no pattern here reaches an opcode belonging
+# to any instruction outside its own family; the option bits are the only
+# axis along which the patterns are wider than a single documented row.
+
+####
+# Multiply 32-Bit Operands, table C-17. This one is 16 bits wide and belongs
+# in insn16.decode; everything below it is 32 bits and belongs in
+# insn32.decode.
+####
+
+mul32_d_d       0100 0000 11 src:3 dst:3
 # ---- end merged instruction fragments ----

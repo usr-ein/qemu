@@ -88,12 +88,13 @@ lsetup1_ph      1110 0000 1111 spc:4    preg:4 00 epc:10
 ####
 # 32-bit: load and store with a large displacement, table C-10.
 #
-# The second word is a two's complement displacement, pre-divided by the
-# access size. The manual lists the add and subtract spellings as separate
-# rows with disjoint ranges, which is equally consistent with a sign bit plus
-# an unsigned magnitude - but that reading makes the firmware's own iw1 of
-# 0xFFF4 mean -131024 rather than -48, addressing far outside the table the
-# instruction is walking. One pattern per form, signed.
+# The second word is not a two's complement offset. Bit 15 selects the
+# direction and bits 14-0 hold an unsigned magnitude, pre-divided by the
+# access size for the word and half word forms. That is what makes the
+# documented immediates uimm17m4 (0 to 131068, section 8 "Load Data
+# Register"), uimm16m2 (0 to 65534) and uimm15 (0 to 32767) exactly
+# representable: each is a 15-bit field times its scale. The manual gives the
+# two directions as separate rows, and so do these patterns.
 ####
 
 ld_d_p_off17    1110 0100 00 pb:3 rd:3  off:s16
@@ -130,4 +131,240 @@ ld_a_zero       1100 0100 0000 1000     1000 0000 0011 1111
 ####
 
 mov_dl_a0x      1100 0100 0000 1010    0000 rd:3 000 111111
+
+# from a4.decode
+
+####
+# 32-bit ALU: word add and subtract, table C-17
+####
+
+add_d_d_ns      1100 0100 0000 0100  0000 dst:3 000 src0:3 src1:3
+add_d_d_s       1100 0100 0000 0100  0010 dst:3 000 src0:3 src1:3
+sub_d_d_ns      1100 0100 0000 0100  0100 dst:3 000 src0:3 src1:3
+sub_d_d_s       1100 0100 0000 0100  0110 dst:3 000 src0:3 src1:3
+
+####
+# 32-bit ALU: half-word add and subtract, table C-17. The name encodes the
+# destination half and then the half each source comes from.
+####
+
+add16_l_ll      1100 0100 0000 0010  0000 dst:3 000 src0:3 src1:3
+add16_l_ll_s    1100 0100 0000 0010  0010 dst:3 000 src0:3 src1:3
+add16_l_lh      1100 0100 0000 0010  0100 dst:3 000 src0:3 src1:3
+add16_l_lh_s    1100 0100 0000 0010  0110 dst:3 000 src0:3 src1:3
+add16_l_hl      1100 0100 0000 0010  1000 dst:3 000 src0:3 src1:3
+add16_l_hl_s    1100 0100 0000 0010  1010 dst:3 000 src0:3 src1:3
+add16_l_hh      1100 0100 0000 0010  1100 dst:3 000 src0:3 src1:3
+add16_l_hh_s    1100 0100 0000 0010  1110 dst:3 000 src0:3 src1:3
+
+add16_h_ll      1100 0100 0010 0010  0000 dst:3 000 src0:3 src1:3
+add16_h_ll_s    1100 0100 0010 0010  0010 dst:3 000 src0:3 src1:3
+add16_h_lh      1100 0100 0010 0010  0100 dst:3 000 src0:3 src1:3
+add16_h_lh_s    1100 0100 0010 0010  0110 dst:3 000 src0:3 src1:3
+add16_h_hl      1100 0100 0010 0010  1000 dst:3 000 src0:3 src1:3
+add16_h_hl_s    1100 0100 0010 0010  1010 dst:3 000 src0:3 src1:3
+add16_h_hh      1100 0100 0010 0010  1100 dst:3 000 src0:3 src1:3
+add16_h_hh_s    1100 0100 0010 0010  1110 dst:3 000 src0:3 src1:3
+
+sub16_l_ll      1100 0100 0000 0011  0000 dst:3 000 src0:3 src1:3
+sub16_l_ll_s    1100 0100 0000 0011  0010 dst:3 000 src0:3 src1:3
+sub16_l_lh      1100 0100 0000 0011  0100 dst:3 000 src0:3 src1:3
+sub16_l_lh_s    1100 0100 0000 0011  0110 dst:3 000 src0:3 src1:3
+sub16_l_hl      1100 0100 0000 0011  1000 dst:3 000 src0:3 src1:3
+sub16_l_hl_s    1100 0100 0000 0011  1010 dst:3 000 src0:3 src1:3
+sub16_l_hh      1100 0100 0000 0011  1100 dst:3 000 src0:3 src1:3
+sub16_l_hh_s    1100 0100 0000 0011  1110 dst:3 000 src0:3 src1:3
+
+sub16_h_ll      1100 0100 0010 0011  0000 dst:3 000 src0:3 src1:3
+sub16_h_ll_s    1100 0100 0010 0011  0010 dst:3 000 src0:3 src1:3
+sub16_h_lh      1100 0100 0010 0011  0100 dst:3 000 src0:3 src1:3
+sub16_h_lh_s    1100 0100 0010 0011  0110 dst:3 000 src0:3 src1:3
+sub16_h_hl      1100 0100 0010 0011  1000 dst:3 000 src0:3 src1:3
+sub16_h_hl_s    1100 0100 0010 0011  1010 dst:3 000 src0:3 src1:3
+sub16_h_hh      1100 0100 0010 0011  1100 dst:3 000 src0:3 src1:3
+sub16_h_hh_s    1100 0100 0010 0011  1110 dst:3 000 src0:3 src1:3
+
+####
+# 32-bit ALU: maximum, minimum, absolute value and negate, table C-17
+####
+
+max_d_d         1100 0100 0000 0111  0000 dst:3 000 src0:3 src1:3
+min_d_d         1100 0100 0000 0111  0100 dst:3 000 src0:3 src1:3
+abs_d           1100 0100 0000 0111  1000 dst:3 000 src0:3 000
+
+# The manual prints these two ranges as 0xC407C000-0xC407CFC0 and
+# 0xC407E000-0xC407EFC0, which would put the source in bits 8-6 and leave
+# bits 5-3 fixed. The bit diagram on the same row says "Dest / 0 0 0 /
+# Source / 0 0 0", i.e. bits 5-3, and every neighbouring one-operand row -
+# Absolute Value above and Vector Negate at 0xC40FC000 - ends at 0xE38 with
+# that layout. The printed range end is collation damage; the diagram is
+# authoritative, so tools/bfin_checkdecode.py reports these two rows.
+neg_d_ns        1100 0100 0000 0111  1100 dst:3 000 src0:3 000
+neg_d_s         1100 0100 0000 0111  1110 dst:3 000 src0:3 000
+
+####
+# Quad 8-bit pack, table C-20. Unlike the other BYTEOP forms this one needs
+# no byte-alignment state, so it belongs with the plain ALU work.
+####
+
+bytepack        1100 0100 0001 1000  0000 dst:3 000 src0:3 src1:3
+
+####
+# Shifter with a register magnitude, table C-16. First word is
+# 1100 0110 0 xx0 <sopcde:4>; second word is <sop:2> <HLs:2> <dst:3> <xxx>
+# <src0:3> <src1:3>.
+#
+# The row labels put the shifted value in bits 5-3 and the magnitude in bits
+# 2-0, but every other row of this group puts the value in bits 2-0: the
+# accumulator rows (0xC6030000, "A0 = ASHIFT A0 BY Dreg_lo") have their only
+# register operand - which can only be the magnitude - in bits 5-3, and
+# SIGNBITS, ONES, EXTRACT and DEPOSIT all take their data operand from bits
+# 2-0 with the auxiliary operand in bits 5-3. The rotate-by-constant form
+# 0xC682C000 likewise has its source in bits 2-0. The two labels on these
+# rows are transposed; the value is in bits 2-0 and the magnitude in 5-3.
+####
+
+ashift16_l_l    1100 0110 0000 0000  0000 dst:3 000 mag:3 src:3
+ashift16_l_h    1100 0110 0000 0000  0001 dst:3 000 mag:3 src:3
+
+ashift_d        1100 0110 0000 0010  0000 dst:3 000 mag:3 src:3
+ashift_d_s      1100 0110 0000 0010  0100 dst:3 000 mag:3 src:3
+lshift_d        1100 0110 0000 0010  1000 dst:3 000 mag:3 src:3
+rot_d_d         1100 0110 0000 0010  1100 dst:3 000 mag:3 src:3
+
+####
+# Sign bit and bit field operations, tables C-15 and C-17.
+#
+# Bit Field Extraction at 0xC60A0000 and 0xC60A4000 is already merged from
+# a0.decode as extract_z and extract_x, so only the deposit half is here.
+####
+
+signbits_d      1100 0110 0000 0101  0000 dst:3 000 000 src:3
+
+deposit         1100 0110 0000 1010  1000 dst:3 000 fg:3 bg:3
+
+####
+# Shifter with a constant magnitude, table C-16. First word is
+# 1100 0110 1 xx0 <sopcde:4>. In the second word bits 8-3 are one signed
+# magnitude field: positive shifts left, negative shifts right by its
+# magnitude, so the two directions of the same instruction are two rows with
+# different fixed high bits. The immediate below is only the varying part,
+# and a4.c.inc turns it back into a shift count.
+####
+
+asr_imm32       1100 0110 1000 0010  0000 dst:3 1 imm:5 src:3
+lsl_imm32       1100 0110 1000 0010  1000 dst:3 0 imm:5 src:3
+lsr_imm32       1100 0110 1000 0010  1000 dst:3 1 imm:5 src:3
+
+# Rotate by a constant, 0xC682C000, is already merged from a0.decode as
+# rot_imm.
+
+lsl16_l_l       1100 0110 1000 0000  1000 dst:3 00 imm:4 src:3
+lsr16_l_l       1100 0110 1000 0000  1000 dst:3 11 imm:4 src:3
+lsl16_l_h       1100 0110 1000 0000  1001 dst:3 00 imm:4 src:3
+lsr16_l_h       1100 0110 1000 0000  1001 dst:3 11 imm:4 src:3
+lsl16_h_l       1100 0110 1000 0000  1010 dst:3 00 imm:4 src:3
+lsr16_h_l       1100 0110 1000 0000  1010 dst:3 11 imm:4 src:3
+lsl16_h_h       1100 0110 1000 0000  1011 dst:3 00 imm:4 src:3
+lsr16_h_h       1100 0110 1000 0000  1011 dst:3 11 imm:4 src:3
+
+lsl_imm_v       1100 0110 1000 0001  1000 dst:3 00 imm:4 src:3
+lsr_imm_v       1100 0110 1000 0001  1000 dst:3 11 imm:4 src:3
+
+asr_imm_a0      1100 0110 1000 0011  0000 000 1 imm:5 000
+lsr_imm_a0      1100 0110 1000 0011  0100 000 1 imm:5 000
+lsr_imm_a1      1100 0110 1000 0011  0101 000 1 imm:5 000
+
+# from a5.decode
+
+####
+# Multiply 16-Bit Operands and Multiply (Vector), table C-17.
+#
+# op0 and op1 are zero throughout: no accumulator is read or written. The
+# three patterns are the three ways the destination can be named - MAC0 only,
+# MAC1 only, or both - and each covers the register-half form (p = 0) and the
+# 32-bit register form (p = 1).
+####
+
+# Dreg_lo = Dreg_lo_hi * Dreg_lo_hi ; Dreg_even = Dreg_lo_hi * Dreg_lo_hi
+mult_m0         1100 0 01 mmod:4 mm:1 p:1 0 00 0 0 1 00 h00:1 h10:1 dst:3 src0:3 src1:3
+
+# Dreg_hi = Dreg_lo_hi * Dreg_lo_hi ; Dreg_odd = Dreg_lo_hi * Dreg_lo_hi
+mult_m1         1100 0 01 mmod:4 mm:1 p:1 1 00 h01:1 h11:1 0 00 0 0 dst:3 src0:3 src1:3
+
+# Dreg_lo = ... , Dreg_hi = ... ; Dreg_even = ... , Dreg_odd = ...
+mult_v          1100 0 01 mmod:4 mm:1 p:1 1 00 h01:1 h11:1 1 00 h00:1 h10:1 dst:3 src0:3 src1:3
+
+####
+# Multiply and Multiply-Accumulate to Accumulator, to Half Register and to
+# Data Register, and Multiply and Multiply-Accumulate (Vector), table C-17.
+#
+# An operation field of 3 means that MAC is idle. The first two patterns have
+# MAC1 running, so op0 may take any value including 3, which is how the
+# vector forms that drive only one accumulator are spelled. The last two have
+# MAC1 idle and so must exclude op0 = 3 as well: op0 = op1 = 3 with both
+# write bits clear is MNOP, and with a write bit set it is a Move Register
+# Half. Both belong to other instruction families.
+#
+# op1 = 3 with w1 set (Dreg_hi = A1, Dreg_odd = A1) is likewise a Move
+# Register Half and is deliberately left undecoded here.
+####
+
+# MAC1 does "=" or "+="
+mac_m1          1100 0 00 mmod:4 mm:1 p:1 w1:1 0 op1:1 h01:1 h11:1 w0:1 op0:2 h00:1 h10:1 dst:3 src0:3 src1:3
+
+# MAC1 does "-="
+mac_m1_sub      1100 0 00 mmod:4 mm:1 p:1 w1:1 10 h01:1 h11:1 w0:1 op0:2 h00:1 h10:1 dst:3 src0:3 src1:3
+
+# MAC1 idle, MAC0 does "=" or "+="
+mac_m0          1100 0 00 mmod:4 mm:1 p:1 0 11 0 0 w0:1 0 op0:1 h00:1 h10:1 dst:3 src0:3 src1:3
+
+# MAC1 idle, MAC0 does "-="
+mac_m0_sub      1100 0 00 mmod:4 mm:1 p:1 0 11 0 0 w0:1 10 h00:1 h10:1 dst:3 src0:3 src1:3
+
+####
+# Vector Add / Subtract, table C-21.
+#
+# The ALU group numbers its opcode fields aopcde (bits 20:16) and HL (bit
+# 21). In the second word bits 15:14 are the operation pair, bit 13 saturates
+# and bit 12 is the cross option. Bits 11:9 hold the manual's "Dest 1"
+# register number and bits 8:6 its "Dest 0"; note that the manual's Dest 0
+# takes the first result named in the syntax. The single-destination forms
+# use bits 11:9 only and encode bits 8:6 as zero.
+#
+# In the dual 16-bit forms aop bit 1 subtracts the high halves and bit 0 the
+# low halves, so 0 is +|+, 1 is +|-, 2 is -|+ and 3 is -|-. In the quad forms
+# aop is instead the scaling option: 0 none, 2 ASR, 3 ASL, 1 reserved.
+####
+
+# Dreg = Dreg +|+ Dreg and the three other sign pairs, with (S) and (CO)
+vadd16          1100 0 10 000 0 00000 aop:2 s:1 co:1 dst:3 000 src0:3 src1:3
+
+# Dreg = Dreg +|+ Dreg, Dreg = Dreg -|- Dreg
+vadd16_q        1100 0 10 000 0 00001 aop:2 s:1 co:1 dst1:3 dst0:3 src0:3 src1:3
+
+# Dreg = Dreg +|- Dreg, Dreg = Dreg -|+ Dreg
+vadd16_qx       1100 0 10 000 1 00001 aop:2 s:1 co:1 dst1:3 dst0:3 src0:3 src1:3
+
+# Dreg = Dreg + Dreg, Dreg = Dreg - Dreg
+vadd32          1100 0 10 000 0 00100 10 0 0 dst1:3 dst0:3 src0:3 src1:3
+vadd32_s        1100 0 10 000 0 00100 10 1 0 dst1:3 dst0:3 src0:3 src1:3
+
+####
+# Vector Maximum and Vector Minimum, table C-21
+####
+
+vmax16          1100 0 10 000 0 00110 00 0 0 dst:3 000 src0:3 src1:3
+vmin16          1100 0 10 000 0 00110 01 0 0 dst:3 000 src0:3 src1:3
+
+####
+# Vector Pack, table C-21. This is in the shifter group: bits 20:16 are
+# sopcde and bit 23 selects the shift-by-immediate forms. Bits 15 and 14 of
+# the second word pick the half taken from src0 and from src1 respectively.
+####
+
+pack_ll         1100 0 11 0 0 00 00100 00 00 dst:3 000 src0:3 src1:3
+pack_lh         1100 0 11 0 0 00 00100 01 00 dst:3 000 src0:3 src1:3
+pack_hl         1100 0 11 0 0 00 00100 10 00 dst:3 000 src0:3 src1:3
+pack_hh         1100 0 11 0 0 00 00100 11 00 dst:3 000 src0:3 src1:3
 # ---- end merged instruction fragments ----

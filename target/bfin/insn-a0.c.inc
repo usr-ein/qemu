@@ -1,4 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Rotate through CC. The rotation is 33 bits wide - CC sits above bit 31 -
  * so a rotate by one moves bit 31 into CC and CC into bit 0. A negative

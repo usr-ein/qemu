@@ -9,3 +9,10 @@ DEF_HELPER_2(read_creg, i32, env, i32)
 DEF_HELPER_3(write_creg, void, env, i32, i32)
 DEF_HELPER_3(rot, i32, env, i32, s32)
 DEF_HELPER_FLAGS_3(bitextract, TCG_CALL_NO_RWG_SE, i32, i32, i32, i32)
+
+/* multiply and MAC, from insn-a5 */
+DEF_HELPER_7(mac, i32, env, i32, i32, i32, i32, i32, i32)
+DEF_HELPER_6(vadd16, i32, env, i32, i32, i32, i32, i32)
+DEF_HELPER_7(vadd16_q, i64, env, i32, i32, i32, i32, i32, i32)
+DEF_HELPER_4(vadd32, i64, env, i32, i32, i32)
+DEF_HELPER_4(vminmax16, i32, env, i32, i32, i32)
