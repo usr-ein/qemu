@@ -16,10 +16,6 @@
 # is programmed; the Preg forms take the trip count from a pointer register.
 ####
 
-lsetup0         1110 0000 1000 spc:4    000000 epc:10
-lsetup1         1110 0000 1001 spc:4    000000 epc:10
-lsetup0_p       1110 0000 1010 spc:4    preg:4 00 epc:10
-lsetup1_p       1110 0000 1011 spc:4    preg:4 00 epc:10
 
 ####
 # Load immediate, table C-10.
@@ -41,21 +37,6 @@ ldimm_z         1110 0001 100 reg:5     imm:16
 jump_l          1110 0010 hi:8          lo:16
 call_l          1110 0011 hi:8          lo:16
 
-####
-# Load and store with a large displacement, table C-10.
-#
-# The word forms scale the displacement by four and the byte forms do not.
-# The manual names these uimm17m4 and uimm15 and gives separate rows for the
-# add and subtract spellings; the encoded displacement is signed, so one
-# pattern covers both.
-####
-
-ld_d_p_off17    1110 0100 00 pb:3 rd:3  off:s16
-ld_db_p_off     1110 0100 10 pb:3 rd:3  off:s16
-ld_p_p_off17    1110 0101 00 pb:3 rd:3  off:s16
-st_p_off17_d    1110 0110 00 pb:3 rs:3  off:s16
-st_pb_off_d     1110 0110 10 pb:3 rs:3  off:s16
-st_p_off17_p    1110 0111 00 pb:3 rs:3  off:s16
 
 ####
 # Stack frame management, table C-13
@@ -63,3 +44,90 @@ st_p_off17_p    1110 0111 00 pb:3 rs:3  off:s16
 
 link            1110 1000 0000 0000     imm:16
 unlink          1110 1000 0000 0001     0000 0000 0000 0000
+
+lsetup0         1110 0000 1000 spc:4    000000 epc:10
+lsetup1         1110 0000 1001 spc:4    000000 epc:10
+lsetup0_p       1110 0000 1010 spc:4    preg:4 00 epc:10
+lsetup1_p       1110 0000 1011 spc:4    preg:4 00 epc:10
+
+# ---- merged instruction fragments: do not edit below this line ----
+
+# from a0.decode
+# Instructions added by the lead to unblock the firmware, ahead of the family
+# agent that owns them. Merged first, so an agent's duplicate is dropped.
+
+####
+# Rotate, table C-16. The rotate is 33 bits wide: CC participates as the bit
+# above the register, which is how multi-word shifts are built.
+####
+
+rot_imm         1100 0110 1000 0010    1100 dst:3 imm:s6 src:3
+
+####
+# Bit field extraction, table C-16. The pattern register carries the field
+# definition rather than the instruction: position in bits 12-8 and length in
+# bits 4-0, per table 13-2.
+####
+
+extract_z       1100 0110 0000 1010     0000 dst:3 000 pat:3 scene:3
+extract_x       1100 0110 0000 1010     0100 dst:3 000 pat:3 scene:3
+
+# from a2.decode
+
+####
+# 32-bit: zero overhead loop setup, table C-9.
+#
+# Bit 4 of the first word selects LC0 or LC1, bit 5 asks for the counter to be
+# loaded from a pointer register and bit 6 for that value to be halved. The
+# combination with bit 6 set and bit 5 clear is not documented.
+####
+
+lsetup0_ph      1110 0000 1110 spc:4    preg:4 00 epc:10
+lsetup1_ph      1110 0000 1111 spc:4    preg:4 00 epc:10
+
+####
+# 32-bit: load and store with a large displacement, table C-10.
+#
+# The second word is a two's complement displacement, pre-divided by the
+# access size. The manual lists the add and subtract spellings as separate
+# rows with disjoint ranges, which is equally consistent with a sign bit plus
+# an unsigned magnitude - but that reading makes the firmware's own iw1 of
+# 0xFFF4 mean -131024 rather than -48, addressing far outside the table the
+# instruction is walking. One pattern per form, signed.
+####
+
+ld_d_p_off17    1110 0100 00 pb:3 rd:3  off:s16
+ld_p_p_off17    1110 0101 00 pb:3 rd:3  off:s16
+st_p_off17_d    1110 0110 00 pb:3 rs:3  off:s16
+st_p_off17_p    1110 0111 00 pb:3 rs:3  off:s16
+ldw_d_p_off16_z  1110 0100 01 pb:3 rd:3  off:s16
+ldw_d_p_off16_x  1110 0101 01 pb:3 rd:3  off:s16
+stw_p_off16_d    1110 0110 01 pb:3 rs:3  off:s16
+ldb_d_p_off15_z  1110 0100 10 pb:3 rd:3  off:s16
+ldb_d_p_off15_x  1110 0101 10 pb:3 rd:3  off:s16
+stb_p_off15_d    1110 0110 10 pb:3 rs:3  off:s16
+####
+# 32-bit: no-op and population count, tables C-19 and C-21.
+#
+# These three sit in the 0xC000 multiply and MAC encoding space and are the
+# fully fixed corners of it, so they have to be matched ahead of the MAC
+# patterns.
+####
+
+mnop            1100 0000 0000 0011     0001 1000 0000 0000
+ones            1100 0110 0000 0110     1100 dst:3 000000 src:3
+ld_a_zero       1100 0100 0000 1000     1000 0000 0011 1111
+
+# from a3.decode
+
+####
+# Move Register Half, table C-11.
+#
+# Bits 8 to 6 of the first word are don't-care for this instruction, but the
+# assembler emits zero and the manual's opcode range assumes it, so they are
+# fixed here. The two source fields in the second word read 0x3F for the
+# accumulator extension source.
+####
+
+mov_dl_a0x      1100 0100 0000 1010    0000 rd:3 000 111111
+# ---- end merged instruction fragments ----

@@ -60,8 +60,6 @@ movereg         0011 dg:3 sg:3 dn:3 sn:3
 cc_eq_dreg      0000 1000 00 src:3 dst:3
 cc_lt_dreg      0000 1000 10 src:3 dst:3
 cc_le_dreg      0000 1001 00 src:3 dst:3
-cc_ltu_dreg     0000 1000 11 src:3 dst:3
-cc_leu_dreg     0000 1001 01 src:3 dst:3
 
 cc_eq_imm       0000 1100 00 imm:s3 dst:3
 cc_lt_imm       0000 1100 10 imm:s3 dst:3
@@ -158,3 +156,248 @@ bitclr          0100 1100 imm:5 rd:3
 asr_imm         0100 1101 imm:5 rd:3
 lsr_imm         0100 1110 imm:5 rd:3
 lsl_imm         0100 1111 imm:5 rd:3
+
+# ---- merged instruction fragments: do not edit below this line ----
+
+# from a1.decode
+####
+# Load and store, half word and byte through a pointer, table C-10.
+#
+# The group at 0x9000 is laid out as 1001, a two bit access size, the write
+# flag, a two bit address mode, and a flag which for loads picks sign over
+# zero extension and for pointer sized accesses picks a P register over a D
+# register. Size 01 is the half word block below and size 10 the byte block;
+# size 00 (the word forms) and size 11 (the I register forms) are elsewhere.
+####
+
+ldw_d_pp_z      1001 0100 00 pb:3 rd:3
+ldw_d_pp_x      1001 0100 01 pb:3 rd:3
+ldw_d_pd_z      1001 0100 10 pb:3 rd:3
+ldw_d_pd_x      1001 0100 11 pb:3 rd:3
+ldw_d_p_z       1001 0101 00 pb:3 rd:3
+ldw_d_p_x       1001 0101 01 pb:3 rd:3
+stw_pp_d        1001 0110 00 pb:3 rs:3
+stw_pd_d        1001 0110 10 pb:3 rs:3
+stw_p_d         1001 0111 00 pb:3 rs:3
+
+ldb_d_pp_z      1001 1000 00 pb:3 rd:3
+ldb_d_pp_x      1001 1000 01 pb:3 rd:3
+ldb_d_pd_z      1001 1000 10 pb:3 rd:3
+ldb_d_pd_x      1001 1000 11 pb:3 rd:3
+ldb_d_p_z       1001 1001 00 pb:3 rd:3
+ldb_d_p_x       1001 1001 01 pb:3 rd:3
+stb_pp_d        1001 1010 00 pb:3 rs:3
+stb_pd_d        1001 1010 10 pb:3 rs:3
+stb_p_d         1001 1011 00 pb:3 rs:3
+
+####
+# Post-modify index forms, table C-10 sheets 3, 5, 6, 7, 10 and 12.
+#
+# Operation codes 01 and 10 - the two that move a register half - are the only
+# ones with a plain [Preg] spelling, and it is the encoding whose two pointer
+# fields name the same register. The remaining operation codes have no such
+# spelling and always advance the pointer, so the translator distinguishes
+# them rather than the decoder.
+####
+
+ld_pi_d         1000 000 rd:3 pi:3 pb:3
+ldw_pi_dl       1000 001 rd:3 pi:3 pb:3
+ldw_pi_dh       1000 010 rd:3 pi:3 pb:3
+
+####
+# Access through an index register, table C-10 sheets 4, 6, 10 and 11.
+#
+# The word forms post-modify by four and the half word forms by two. The
+# 0x9D80 and 0x9F80 rows take the modifier from an M register instead.
+####
+
+ldw_dh_ip       1001 1100 010 ireg:2 rd:3
+ld_d_id         1001 1100 100 ireg:2 rd:3
+ldw_dl_id       1001 1100 101 ireg:2 rd:3
+ldw_dh_id       1001 1100 110 ireg:2 rd:3
+ldw_dh_i        1001 1101 010 ireg:2 rd:3
+ld_d_im         1001 1101 1 mreg:2 ireg:2 rd:3
+
+stw_ip_dl       1001 1110 001 ireg:2 rs:3
+stw_ip_dh       1001 1110 010 ireg:2 rs:3
+st_id_d         1001 1110 100 ireg:2 rs:3
+stw_id_dl       1001 1110 101 ireg:2 rs:3
+stw_id_dh       1001 1110 110 ireg:2 rs:3
+stw_i_dl        1001 1111 001 ireg:2 rs:3
+stw_i_dh        1001 1111 010 ireg:2 rs:3
+st_im_d         1001 1111 1 mreg:2 ireg:2 rs:3
+
+####
+# Frame pointer relative, table C-10 sheets 2, 3, 9 and 10.
+#
+# uimm7m4 is stored divided by four and is always subtracted, so these reach
+# the 128 bytes below FP where a frame's locals live. The register number is
+# the four bit group 0 and 1 encoding of table C-4: bit 3 clear selects a D
+# register and bit 3 set a P register, which is why the manual splits each
+# access into two opcode rows.
+####
+
+ld_d_fp_off     1011 100 off:5 0 rd:3
+ld_p_fp_off     1011 100 off:5 1 rd:3
+st_fp_off_d     1011 101 off:5 0 rs:3
+st_fp_off_p     1011 101 off:5 1 rs:3
+
+####
+# Push and pop of a register range, table C-12.
+#
+# Bit 8 includes the data registers, bit 7 the pointer registers and bit 6
+# selects push over pop. Each register field holds the lowest numbered
+# register of the range; the highest is always R7 or P5. Preglim only runs to
+# P5, so the two encodings above that are reserved and the translator rejects
+# them - the decoder cannot express the bound.
+####
+
+pop_mult_p      0000 0100 10 000 pr:3
+push_mult_p     0000 0100 11 000 pr:3
+pop_mult_d      0000 0101 00 dr:3 000
+push_mult_d     0000 0101 01 dr:3 000
+pop_mult        0000 0101 10 dr:3 pr:3
+push_mult       0000 0101 11 dr:3 pr:3
+
+####
+# Cache control, table C-19. Bit 5 is the post-increment flag and bits 4 and 3
+# the operation.
+####
+
+prefetch_p      0000 0010 0100 0 pb:3
+flushinv_p      0000 0010 0100 1 pb:3
+flush_p         0000 0010 0101 0 pb:3
+iflush_p        0000 0010 0101 1 pb:3
+prefetch_pp     0000 0010 0110 0 pb:3
+flushinv_pp     0000 0010 0110 1 pb:3
+flush_pp        0000 0010 0111 0 pb:3
+iflush_pp       0000 0010 0111 1 pb:3
+
+# from a2.decode
+# Analog Devices Blackfin instruction encodings: 32-bit load and store,
+# hardware loops, and the remaining program flow and no-op forms.
+#
+# Copyright (c) 2026 cdj2knxs contributors
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Encodings are from the Blackfin Processor Programming Reference rev 2.2,
+# appendix C, tables C-9 (program flow), C-10 (load/store), C-17 (logic) and
+# C-19/C-21 (no-op and population count).
+#
+# The one 16-bit pattern belongs in insn16.decode and the rest in
+# insn32.decode.
+
+####
+# 16-bit: one's complement, table C-17
+####
+
+not_d           0100 0011 11 src:3 dst:3
+
+# from a3.decode
+# Analog Devices Blackfin move and condition-code encodings
+#
+# Copyright (c) 2026 cdj2knxs contributors
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Encodings are from the Blackfin Processor Programming Reference rev 2.2,
+# appendix C, tables C-11 (Move), C-13 (Control Code Bit Management) and
+# C-21 (Miscellaneous). Field order follows the manual's bit diagrams.
+#
+# cc_lt_preg and cc_le_preg replace cc_ltu_dreg and cc_leu_dreg as they stand
+# in insn16.decode. Those two claim 0x08C0 and 0x0940, which table C-13 gives
+# to the signed pointer compares; the unsigned data register compares they
+# were meant to be are two comparison codes further on, at 0x0980 and 0x0A00,
+# and appear below as cc_lt_dreg_iu and cc_le_dreg_iu.
+
+####
+# Compare, table C-13.
+#
+# One format covers all twenty rows: bit 10 selects an immediate second
+# operand, bits 9 to 7 the comparison, and bit 6 pointer rather than data
+# registers. The first operand is bits 2 to 0 (the manual's "Dest reg #") and
+# the second bits 5 to 3, so CC = dst <op> src.
+#
+# Comparison 0 is ==, 1 is < and 2 is <=, all signed; 3 and 4 are the
+# unsigned < and <= that the syntax spells (IU). The immediate is signed for
+# the first three and unsigned for the last two, matching the manual's
+# imm3 / uimm3 spelling.
+####
+
+cc_eq_preg      0000 1000 01 src:3 dst:3
+
+# 0x08C0 and 0x0940 have bit 6 set, so they are the *signed pointer* compares.
+# The unsigned data register compares are two comparison codes further on, at
+# 0x0980 and 0x0A00.
+cc_lt_preg      0000 1000 11 src:3 dst:3
+cc_le_preg      0000 1001 01 src:3 dst:3
+
+cc_lt_dreg_iu   0000 1001 10 src:3 dst:3
+cc_lt_preg_iu   0000 1001 11 src:3 dst:3
+cc_le_dreg_iu   0000 1010 00 src:3 dst:3
+cc_le_preg_iu   0000 1010 01 src:3 dst:3
+
+cc_eq_imm_p     0000 1100 01 imm:s3 dst:3
+cc_lt_imm_p     0000 1100 11 imm:s3 dst:3
+cc_le_imm_p     0000 1101 01 imm:s3 dst:3
+
+cc_lt_imm_iu    0000 1101 10 imm:3 dst:3
+cc_lt_imm_p_iu  0000 1101 11 imm:3 dst:3
+cc_le_imm_iu    0000 1110 00 imm:3 dst:3
+cc_le_imm_p_iu  0000 1110 01 imm:3 dst:3
+
+####
+# Move CC to and from a status bit, table C-13.
+#
+# Bits 7 to 5 give the direction and the operation, and the five bit field is
+# the ASTAT bit number of the operand. The named operands are AZ, AN, AC0,
+# AC1, AV0, AV0S, AV1, AV1S, AQ, V and VS; CC itself is not one of them.
+####
+
+cc_from_stat    0000 0011 000 bit:5
+cc_or_stat      0000 0011 001 bit:5
+cc_and_stat     0000 0011 010 bit:5
+cc_xor_stat     0000 0011 011 bit:5
+
+stat_from_cc    0000 0011 100 bit:5
+stat_or_cc      0000 0011 101 bit:5
+stat_and_cc     0000 0011 110 bit:5
+stat_xor_cc     0000 0011 111 bit:5
+
+####
+# Move Conditional, table C-11. Bit 8 is the sense of the test, bit 7 selects
+# a pointer destination and bit 6 a pointer source. Here the destination is
+# bits 5 to 3 and the source bits 2 to 0, the opposite way round from the
+# compares above.
+####
+
+movncc_d_d      0000 0110 00 dst:3 src:3
+movncc_d_p      0000 0110 01 dst:3 src:3
+movncc_p_d      0000 0110 10 dst:3 src:3
+movncc_p_p      0000 0110 11 dst:3 src:3
+
+movcc_d_d       0000 0111 00 dst:3 src:3
+movcc_d_p       0000 0111 01 dst:3 src:3
+movcc_p_d       0000 0111 10 dst:3 src:3
+movcc_p_p       0000 0111 11 dst:3 src:3
+
+####
+# Move with extension, table C-11. Source is bits 5 to 3 and destination
+# bits 2 to 0, as for the rest of the 0x42xx and 0x43xx block.
+####
+
+mov_dl_x        0100 0010 10 src:3 dst:3
+mov_dl_z        0100 0010 11 src:3 dst:3
+mov_db_x        0100 0011 00 src:3 dst:3
+mov_db_z        0100 0011 01 src:3 dst:3
+
+####
+# Test and Set Byte (Atomic), table C-21.
+#
+# The operand field is four bits wide, as it is for every other member of
+# this block, but only holds a pointer register number. The manual's range
+# stops at 0x00B5 because SP and FP are not allowed here, which the
+# translator enforces; the encoding itself does not carve them out.
+####
+
+testset         0000 0000 1011 0 pb:3
+# ---- end merged instruction fragments ----

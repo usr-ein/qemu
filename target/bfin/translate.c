@@ -338,42 +338,6 @@ static bool trans_if_ncc_jump_bp(DisasContext *ctx, arg_if_ncc_jump_bp *a)
 /* ---------------------------------------------------------------- */
 /* Zero overhead loops                                              */
 
-static bool gen_lsetup(DisasContext *ctx, int n, int spc, int epc, int preg_no,
-                       bool from_preg)
-{
-    tcg_gen_movi_i32(cpu_lt[n], ctx->pc + spc * 2);
-    tcg_gen_movi_i32(cpu_lb[n], ctx->pc + epc * 2);
-    if (from_preg) {
-        tcg_gen_mov_i32(cpu_lc[n], preg(preg_no & 7));
-    }
-    /*
-     * The loop registers are part of the translation key, so a block that
-     * starts a loop must end here: what follows executes with the loop live.
-     */
-    ctx->base.is_jmp = DISAS_UPDATE;
-    return true;
-}
-
-static bool trans_lsetup0(DisasContext *ctx, arg_lsetup0 *a)
-{
-    return gen_lsetup(ctx, 0, a->spc, a->epc, 0, false);
-}
-
-static bool trans_lsetup1(DisasContext *ctx, arg_lsetup1 *a)
-{
-    return gen_lsetup(ctx, 1, a->spc, a->epc, 0, false);
-}
-
-static bool trans_lsetup0_p(DisasContext *ctx, arg_lsetup0_p *a)
-{
-    return gen_lsetup(ctx, 0, a->spc, a->epc, a->preg, true);
-}
-
-static bool trans_lsetup1_p(DisasContext *ctx, arg_lsetup1_p *a)
-{
-    return gen_lsetup(ctx, 1, a->spc, a->epc, a->preg, true);
-}
-
 /* ---------------------------------------------------------------- */
 /* Move                                                             */
 
@@ -431,16 +395,6 @@ static bool trans_cc_lt_dreg(DisasContext *ctx, arg_cc_lt_dreg *a)
 static bool trans_cc_le_dreg(DisasContext *ctx, arg_cc_le_dreg *a)
 {
     return gen_cc_cmp(TCG_COND_LE, dreg(a->dst), dreg(a->src));
-}
-
-static bool trans_cc_ltu_dreg(DisasContext *ctx, arg_cc_ltu_dreg *a)
-{
-    return gen_cc_cmp(TCG_COND_LTU, dreg(a->dst), dreg(a->src));
-}
-
-static bool trans_cc_leu_dreg(DisasContext *ctx, arg_cc_leu_dreg *a)
-{
-    return gen_cc_cmp(TCG_COND_LEU, dreg(a->dst), dreg(a->src));
 }
 
 static bool trans_cc_eq_imm(DisasContext *ctx, arg_cc_eq_imm *a)
@@ -840,42 +794,6 @@ static bool trans_push_reg(DisasContext *ctx, arg_push_reg *a)
     return true;
 }
 
-static bool trans_ld_d_p_off17(DisasContext *ctx, arg_ld_d_p_off17 *a)
-{
-    gen_load(ctx, dreg(a->rd), preg(a->pb), a->off * 4, MO_LEUL);
-    return true;
-}
-
-static bool trans_ld_p_p_off17(DisasContext *ctx, arg_ld_p_p_off17 *a)
-{
-    gen_load(ctx, preg(a->rd), preg(a->pb), a->off * 4, MO_LEUL);
-    return true;
-}
-
-static bool trans_st_p_off17_d(DisasContext *ctx, arg_st_p_off17_d *a)
-{
-    gen_store(ctx, dreg(a->rs), preg(a->pb), a->off * 4, MO_LEUL);
-    return true;
-}
-
-static bool trans_st_p_off17_p(DisasContext *ctx, arg_st_p_off17_p *a)
-{
-    gen_store(ctx, preg(a->rs), preg(a->pb), a->off * 4, MO_LEUL);
-    return true;
-}
-
-static bool trans_ld_db_p_off(DisasContext *ctx, arg_ld_db_p_off *a)
-{
-    gen_load(ctx, dreg(a->rd), preg(a->pb), a->off, MO_UB);
-    return true;
-}
-
-static bool trans_st_pb_off_d(DisasContext *ctx, arg_st_pb_off_d *a)
-{
-    gen_store(ctx, dreg(a->rs), preg(a->pb), a->off, MO_UB);
-    return true;
-}
-
 /* ---------------------------------------------------------------- */
 /* Stack frames                                                     */
 
@@ -1046,7 +964,14 @@ static void gen_loop_end(DisasContext *ctx)
         skip = gen_new_label();
         tcg_gen_brcondi_i32(TCG_COND_NE, cpu_lb[n], ctx->pc, skip);
         tcg_gen_brcondi_i32(TCG_COND_EQ, cpu_lc[n], 0, skip);
+        /*
+         * The counter is decremented at the bottom of the body and the branch
+         * is taken only if it is still nonzero, so a loop set up with LC = N
+         * executes the body exactly N times. Testing for zero before the
+         * decrement instead runs it N + 1 times.
+         */
         tcg_gen_subi_i32(cpu_lc[n], cpu_lc[n], 1);
+        tcg_gen_brcondi_i32(TCG_COND_EQ, cpu_lc[n], 0, skip);
         tcg_gen_mov_i32(cpu_pc, cpu_lt[n]);
         tcg_gen_lookup_and_goto_ptr();
         gen_set_label(skip);
@@ -1166,3 +1091,10 @@ void bfin_translate_code(CPUState *cs, TranslationBlock *tb,
 
     translator_loop(cs, tb, max_insns, pc, host_pc, &bfin_tr_ops, &ctx.base);
 }
+
+/* ---- merged instruction families ---- */
+#include "insn-a0.c.inc"
+#include "insn-a1.c.inc"
+#include "insn-a2.c.inc"
+#include "insn-a3.c.inc"
+/* ---- end merged instruction families ---- */

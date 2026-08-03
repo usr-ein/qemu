@@ -17,6 +17,7 @@
 #include "exec/helper-proto.h"
 #include "accel/tcg/cpu-ldst.h"
 #include "system/runstate.h"
+#include "qemu/main-loop.h"
 
 G_NORETURN void bfin_raise_exception(CPUBfinState *env, int excp,
                                      uint32_t excause, uintptr_t ra)
@@ -66,6 +67,12 @@ void HELPER(sti)(CPUBfinState *env, uint32_t value)
 {
     env->imask = value;
     if (env->ilat & env->imask) {
+        /*
+         * Translated code runs without the big QEMU lock, and cpu_interrupt
+         * asserts that it is held. Devices raise interrupts from a context
+         * that already owns it; a helper has to take it.
+         */
+        BQL_LOCK_GUARD();
         cpu_interrupt(env_cpu(env), CPU_INTERRUPT_HARD);
     }
 }
@@ -74,6 +81,7 @@ void HELPER(raise_ivg)(CPUBfinState *env, uint32_t n)
 {
     env->ilat |= 1u << n;
     if (env->ilat & env->imask) {
+        BQL_LOCK_GUARD();
         cpu_interrupt(env_cpu(env), CPU_INTERRUPT_HARD);
     }
 }
@@ -307,4 +315,51 @@ bool bfin_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
     cs->exception_index = n;
     bfin_cpu_do_interrupt(cs);
     return true;
+}
+
+/*
+ * Rotate a data register through CC, which acts as a 33rd bit above bit 31.
+ * The count is signed: positive rotates left, negative right. Chapter 2 of
+ * the ADSP-BF533 hardware reference describes the shifter.
+ */
+uint32_t HELPER(rot)(CPUBfinState *env, uint32_t value, int32_t count)
+{
+    uint64_t wide = ((uint64_t)(env->cc & 1) << 32) | value;
+    unsigned n = count < 0 ? -count : count;
+
+    n %= 33;
+    if (n) {
+        if (count > 0) {
+            wide = (wide << n) | (wide >> (33 - n));
+        } else {
+            wide = (wide >> n) | (wide << (33 - n));
+        }
+    }
+    env->cc = (wide >> 32) & 1;
+    return wide & 0xffffffff;
+}
+
+/*
+ * Bit field extraction. The pattern register holds the position of the field
+ * in bits 12-8 and its length in bits 4-0 (table 13-2 of the programming
+ * reference). A length of zero yields zero, and bits above the top of the
+ * scene register are treated as zero.
+ */
+uint32_t HELPER(bitextract)(uint32_t scene, uint32_t pattern, uint32_t sign)
+{
+    unsigned pos = (pattern >> 8) & 0x1f;
+    unsigned len = pattern & 0x1f;
+    uint32_t field;
+
+    if (len == 0) {
+        return 0;
+    }
+    field = pos >= 32 ? 0 : scene >> pos;
+    if (len < 32) {
+        field &= (1u << len) - 1;
+        if (sign && (field & (1u << (len - 1)))) {
+            field |= ~((1u << len) - 1);
+        }
+    }
+    return field;
 }
