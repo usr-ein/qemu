@@ -350,6 +350,59 @@ static const MemoryRegionOps sh7764_wdt_ops = {
     .valid.max_access_size = 4,
 };
 
+/* ---------------------------------------------------------------- ATAPI */
+
+/*
+ * ATAPI. No optical drive is modelled - emulating the CDJ's CD mechanism is
+ * out of scope - so the point here is to let the firmware conclude that the
+ * bus is empty and move on.
+ *
+ * An ATA bus with no device attached floats high, so the task file registers
+ * below 0x80 read back all-ones. That is what the firmware's status wait is
+ * looking for: it counts 2000 consecutive 0xff reads and then reports
+ * failure, which is its no-device path. Returning zero instead looks like a
+ * device that is permanently not ready, and it retries forever.
+ *
+ * The controller's own registers from 0x80 up (ATAPI_CONTROL, ATAPI_STATUS,
+ * interrupt enable, the timing and DMA registers) are a plain register file.
+ */
+#define SH7764_ATAPI_TASKFILE_END  0x80
+
+static uint64_t sh7764_atapi_read(void *opaque, hwaddr offset, unsigned size)
+{
+    SH7764State *s = opaque;
+    unsigned idx;
+
+    if (offset < SH7764_ATAPI_TASKFILE_END) {
+        return 0xffffffffu >> ((4 - size) * 8);
+    }
+    idx = (offset - SH7764_ATAPI_TASKFILE_END) / 4;
+    return idx < ARRAY_SIZE(s->atapi_ctl) ? s->atapi_ctl[idx] : 0;
+}
+
+static void sh7764_atapi_write(void *opaque, hwaddr offset, uint64_t value,
+                               unsigned size)
+{
+    SH7764State *s = opaque;
+    unsigned idx;
+
+    if (offset < SH7764_ATAPI_TASKFILE_END) {
+        return; /* nothing on the bus to latch it */
+    }
+    idx = (offset - SH7764_ATAPI_TASKFILE_END) / 4;
+    if (idx < ARRAY_SIZE(s->atapi_ctl)) {
+        s->atapi_ctl[idx] = value;
+    }
+}
+
+static const MemoryRegionOps sh7764_atapi_ops = {
+    .read = sh7764_atapi_read,
+    .write = sh7764_atapi_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
 /* ----------------------------------------------------------------- SDHI */
 
 /*
@@ -593,7 +646,7 @@ static void sh7764_realize(DeviceState *dev, Error **errp)
      * silently reading back zero, which makes it obvious when firmware is
      * waiting on something that was never wired up.
      */
-    create_unimplemented_device("sh7764.p4", 0xff000000, 0x01000000);
+    create_unimplemented_device("sh7764.p4", 0xfe000000, 0x02000000);
 
     memory_region_init_io(&s->ccn, OBJECT(s), &sh7764_ccn_ops, s,
                           "sh7764.ccn", SH7764_CCN_SIZE);
@@ -615,8 +668,9 @@ static void sh7764_realize(DeviceState *dev, Error **errp)
                      SH7764_SSI_A_BASE, SH7764_SSI_SIZE);
     sh7764_bank_init(s, &s->ssi_b, "sh7764.ssi-b",
                      SH7764_SSI_B_BASE, SH7764_SSI_SIZE);
-    sh7764_bank_init(s, &s->atapi, "sh7764.atapi",
-                     SH7764_ATAPI_BASE, SH7764_ATAPI_SIZE);
+    memory_region_init_io(&s->atapi, OBJECT(s), &sh7764_atapi_ops, s,
+                          "sh7764.atapi", SH7764_ATAPI_SIZE);
+    memory_region_add_subregion(sysmem, SH7764_ATAPI_BASE, &s->atapi);
 
     memory_region_init_io(&s->sdhi, OBJECT(s), &sh7764_sdhi_ops, s,
                           "sh7764.sdhi", SH7764_SDHI_SIZE);

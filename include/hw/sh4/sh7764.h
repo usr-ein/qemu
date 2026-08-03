@@ -140,8 +140,9 @@ struct SH7764State {
     SH7764RegBank gpio;
     SH7764RegBank ssi_a;
     SH7764RegBank ssi_b;
-    SH7764RegBank atapi;
     MemoryRegion sdhi;
+    MemoryRegion atapi;
+    uint32_t atapi_ctl[0x40];
     SH7764RegBank misc_a;
 
     /* DMAC state */
