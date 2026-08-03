@@ -119,6 +119,84 @@ static const MemoryRegionOps bf531_core_mmr_ops = {
     .valid.max_access_size = 4,
 };
 
+/*
+ * SPI, chapter 10. The Blackfin boots from SPI flash and the firmware keeps
+ * using the port afterwards, polling SPI_STAT between words. Nothing is
+ * attached in this model, so transfers are reported as having completed the
+ * instant they are started: without that the firmware spins on SPI_STAT
+ * forever and never reaches its own initialisation.
+ */
+#define BF531_SPI_CTL    0x00
+#define BF531_SPI_FLG    0x04
+#define BF531_SPI_STAT   0x08
+#define BF531_SPI_TDBR   0x0c
+#define BF531_SPI_RDBR   0x10
+#define BF531_SPI_BAUD   0x14
+#define BF531_SPI_SHADOW 0x18
+
+#define BF531_SPI_STAT_SPIF (1u << 0)
+#define BF531_SPI_STAT_TXS  (1u << 3)
+#define BF531_SPI_STAT_RXS  (1u << 5)
+
+static uint64_t bf531_spi_read(void *opaque, hwaddr offset, unsigned size)
+{
+    BF531State *s = opaque;
+
+    switch (offset) {
+    case BF531_SPI_CTL:
+        return s->spi_ctl;
+    case BF531_SPI_FLG:
+        return s->spi_flg;
+    case BF531_SPI_STAT:
+        /*
+         * Always finished, transmit buffer drained, receive buffer holding
+         * the word that a transfer with nothing on the bus produces.
+         */
+        return BF531_SPI_STAT_SPIF | BF531_SPI_STAT_RXS;
+    case BF531_SPI_RDBR:
+    case BF531_SPI_SHADOW:
+        /* An idle bus floats high, which is what an absent device reads as. */
+        return 0xffff;
+    case BF531_SPI_TDBR:
+        return s->spi_tdbr;
+    case BF531_SPI_BAUD:
+        return s->spi_baud;
+    }
+    return 0;
+}
+
+static void bf531_spi_write(void *opaque, hwaddr offset, uint64_t value,
+                            unsigned size)
+{
+    BF531State *s = opaque;
+
+    switch (offset) {
+    case BF531_SPI_CTL:
+        s->spi_ctl = value;
+        return;
+    case BF531_SPI_FLG:
+        s->spi_flg = value;
+        return;
+    case BF531_SPI_TDBR:
+        s->spi_tdbr = value;
+        return;
+    case BF531_SPI_BAUD:
+        s->spi_baud = value;
+        return;
+    case BF531_SPI_STAT:
+        /* The error bits are sticky and write-one-to-clear. */
+        return;
+    }
+}
+
+static const MemoryRegionOps bf531_spi_ops = {
+    .read = bf531_spi_read,
+    .write = bf531_spi_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 2,
+    .valid.max_access_size = 4,
+};
+
 static void bf531_realize(DeviceState *dev, Error **errp)
 {
     BF531State *s = BF531(dev);
@@ -169,7 +247,6 @@ static void bf531_realize(DeviceState *dev, Error **errp)
             { BF531_WDOG_BASE,   "bf531.wdog" },
             { BF531_RTC_BASE,    "bf531.rtc" },
             { BF531_UART_BASE,   "bf531.uart" },
-            { BF531_SPI_BASE,    "bf531.spi" },
             { BF531_TIMER_BASE,  "bf531.timer" },
             { BF531_GPIO_BASE,   "bf531.gpio" },
             { BF531_SPORT0_BASE, "bf531.sport0" },
@@ -191,6 +268,10 @@ static void bf531_realize(DeviceState *dev, Error **errp)
      * the PPI is the parallel port that clocks pixels out, and a DMA channel
      * streams the frame buffer into it.
      */
+    memory_region_init_io(&s->spi, OBJECT(dev), &bf531_spi_ops, s,
+                          "bf531.spi", BF531_PERIPH_PAGE);
+    memory_region_add_subregion(sysmem, BF531_SPI_BASE, &s->spi);
+
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->dma), errp)) {
         return;
     }
@@ -207,13 +288,19 @@ static void bf531_realize(DeviceState *dev, Error **errp)
                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->ppi),
                                                        0));
 
-    for (i = 0; i < BF531_ASYNC_BANKS; i++) {
-        g_autofree char *name = g_strdup_printf("bf531.async-bank%u", i);
-
-        hwaddr base = BF531_ASYNC_BASE + i * BF531_ASYNC_BANK_SIZE;
-
-        create_unimplemented_device(name, base, BF531_ASYNC_BANK_SIZE);
-    }
+    /*
+     * The four asynchronous memory banks. On this board they carry the flash
+     * the GUI firmware reads its fonts and bitmaps from, so back them with
+     * memory rather than leaving them unimplemented; a board that has the
+     * flash contents can load them here.
+     */
+    memory_region_init_ram(&s->async, OBJECT(dev), "bf531.async",
+                           BF531_ASYNC_BANKS * BF531_ASYNC_BANK_SIZE,
+                           &error_fatal);
+    /* Erased NOR reads as all ones, which is not what fresh RAM contains. */
+    memset(memory_region_get_ram_ptr(&s->async), 0xff,
+           BF531_ASYNC_BANKS * BF531_ASYNC_BANK_SIZE);
+    memory_region_add_subregion(sysmem, BF531_ASYNC_BASE, &s->async);
 }
 
 static void bf531_init(Object *obj)

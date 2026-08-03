@@ -101,6 +101,13 @@ struct BF531State {
     MemoryRegion l1_inst_c;
     MemoryRegion l1_scratch;
     MemoryRegion core_mmr;
+    MemoryRegion spi;
+    MemoryRegion async;
+
+    uint32_t spi_ctl;
+    uint32_t spi_flg;
+    uint32_t spi_tdbr;
+    uint32_t spi_baud;
 
     uint64_t sdram_size;
 };

@@ -941,14 +941,39 @@ static void bfin_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
         ok = decode_insn32(ctx, opc);
         break;
     }
-    default:
+    default: {
         /*
          * A 64-bit instruction is one 32-bit ALU/MAC operation issued in
-         * parallel with two 16-bit instructions. Not yet implemented; it is
-         * 0.9% of the GUI firmware's instruction stream.
+         * parallel with two 16-bit instructions (chapter 20). Table C-23
+         * lists only the non-parallel encodings, so bit 11 of the first word
+         * is cleared before the wide half is looked up. Either 16-bit slot
+         * may be a NOP, which is what the assembler inserts when the
+         * programmer supplies only one.
+         *
+         * The three are issued together on hardware. Translating them in
+         * sequence is not the same thing, but the difference is only visible
+         * to a pair that reads and writes the same register, which the
+         * assembler rejects.
          */
-        ok = false;
+        uint16_t iw1 = translator_lduw_end(cpu_env(cs), &ctx->base,
+                                           ctx->pc + 2, MO_LE);
+        uint16_t iw2 = translator_lduw_end(cpu_env(cs), &ctx->base,
+                                           ctx->pc + 4, MO_LE);
+        uint16_t iw3 = translator_lduw_end(cpu_env(cs), &ctx->base,
+                                           ctx->pc + 6, MO_LE);
+
+        opc = (((uint32_t)iw0 << 16) | iw1) & ~(0x0800u << 16);
+        ok = decode_insn32(ctx, opc);
+        if (ok) {
+            ok = decode_insn16(ctx, iw2);
+            opc = iw2;
+        }
+        if (ok) {
+            ok = decode_insn16(ctx, iw3);
+            opc = iw3;
+        }
         break;
+    }
     }
 
     if (!ok) {
