@@ -28,6 +28,7 @@
 #include "hw/core/qdev-properties-system.h"
 #include "hw/sh4/sh7764.h"
 #include "hw/sh4/sh.h"
+#include "hw/misc/unimp.h"
 #include "hw/sh4/sh_intc.h"
 #include "hw/timer/tmu012.h"
 #include "system/address-spaces.h"
@@ -349,6 +350,49 @@ static const MemoryRegionOps sh7764_wdt_ops = {
     .valid.max_access_size = 4,
 };
 
+/* ----------------------------------------------------------------- SDHI */
+
+/*
+ * SD host interface. The SH7764 manual lists 0xffe40000 as reserved, but the
+ * CDJ firmware drives a TMIO/Renesas style SD controller there: the offsets it
+ * touches - block count 0x0a, response 0x0c, SD_INFO1 0x1c, SD_INFO2 0x1e and
+ * card options 0x28 - are exactly that layout, and the firmware's own symbol
+ * for the block is "SDINFO1_INI".
+ *
+ * This is a stub, not a card. Its only job is to stop the firmware spinning:
+ * its driver waits for status bits with "read, mask, compare equal" loops, so
+ * the status words read back all-ones and every wait completes immediately.
+ * The command response registers stay zero, so the driver finds no usable card
+ * and moves on.
+ */
+#define SH7764_SDHI_INFO1       0x1c
+#define SH7764_SDHI_INFO2       0x1e
+
+static uint64_t sh7764_sdhi_read(void *opaque, hwaddr offset, unsigned size)
+{
+    switch (offset) {
+    case SH7764_SDHI_INFO1:
+    case SH7764_SDHI_INFO2:
+        return 0xffff;
+    default:
+        return 0;
+    }
+}
+
+static void sh7764_sdhi_write(void *opaque, hwaddr offset, uint64_t value,
+                              unsigned size)
+{
+    /* Nothing to do: there is no card behind this. */
+}
+
+static const MemoryRegionOps sh7764_sdhi_ops = {
+    .read = sh7764_sdhi_read,
+    .write = sh7764_sdhi_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
 /* --------------------------------------------------------------- CPUOPM */
 
 /*
@@ -543,6 +587,14 @@ static void sh7764_realize(DeviceState *dev, Error **errp)
         s->periph_freq = 50000000;
     }
 
+    /*
+     * Catch-all beneath everything else (priority -1000). Peripheral windows
+     * this model does not implement then log under -d unimp instead of
+     * silently reading back zero, which makes it obvious when firmware is
+     * waiting on something that was never wired up.
+     */
+    create_unimplemented_device("sh7764.p4", 0xff000000, 0x01000000);
+
     memory_region_init_io(&s->ccn, OBJECT(s), &sh7764_ccn_ops, s,
                           "sh7764.ccn", SH7764_CCN_SIZE);
     memory_region_add_subregion(sysmem, SH7764_CCN_BASE, &s->ccn);
@@ -565,6 +617,10 @@ static void sh7764_realize(DeviceState *dev, Error **errp)
                      SH7764_SSI_B_BASE, SH7764_SSI_SIZE);
     sh7764_bank_init(s, &s->atapi, "sh7764.atapi",
                      SH7764_ATAPI_BASE, SH7764_ATAPI_SIZE);
+
+    memory_region_init_io(&s->sdhi, OBJECT(s), &sh7764_sdhi_ops, s,
+                          "sh7764.sdhi", SH7764_SDHI_SIZE);
+    memory_region_add_subregion(sysmem, SH7764_SDHI_BASE, &s->sdhi);
     sh7764_bank_init(s, &s->misc_a, "sh7764.misc-ffa0",
                      SH7764_MISC_A_BASE, SH7764_MISC_A_SIZE);
     memory_region_init_io(&s->cpuopm, OBJECT(s), &sh7764_cpuopm_ops, s,
