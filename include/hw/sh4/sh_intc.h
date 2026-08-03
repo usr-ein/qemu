@@ -23,6 +23,14 @@ struct intc_mask_reg {
     unsigned long set_reg, clr_reg, reg_width;
     intc_enum enum_ids[32];
     unsigned long value;
+    /*
+     * Set for controllers whose readable register holds mask bits (1 =
+     * masked) rather than enable bits, such as the SH7764's INT2MSKR. Writes
+     * already work out because setting a mask bit is a disable and the paired
+     * clear register is an enable, but a read has to be inverted or a guest
+     * doing read-modify-write on it computes nonsense.
+     */
+    bool inverted;
 };
 
 struct intc_prio_reg {
@@ -36,6 +44,14 @@ struct intc_prio_reg {
 struct intc_source {
     unsigned short vect;
     intc_enum next_enum_id;
+
+    /*
+     * Priority as currently programmed in the controller's priority
+     * registers, used to arbitrate against SR.IMASK. Sources that no priority
+     * register covers keep the initial value, which is above any IMASK, so
+     * they stay deliverable exactly as before.
+     */
+    int priority;
 
     int asserted; /* emulates the interrupt signal line from device to intc */
     int enable_count;
@@ -57,7 +73,8 @@ struct intc_desc {
     int pending; /* number of interrupt sources that has pending set */
 };
 
-int sh_intc_get_pending_vector(struct intc_desc *desc, int imask);
+int sh_intc_get_pending_vector(struct intc_desc *desc, int imask,
+                               int *priority);
 
 void sh_intc_toggle_source(struct intc_source *source,
                            int enable_adj, int assert_adj);

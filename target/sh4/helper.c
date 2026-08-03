@@ -61,6 +61,7 @@ void superh_cpu_do_interrupt(CPUState *cs)
     CPUSH4State *env = cpu_env(cs);
     int do_irq = cpu_test_interrupt(cs, CPU_INTERRUPT_HARD);
     int do_exp, irq_vector = cs->exception_index;
+    int irq_priority = 0;
     uint64_t last_pc = env->pc;
 
     /* prioritize exceptions over interrupts */
@@ -87,7 +88,8 @@ void superh_cpu_do_interrupt(CPUState *cs)
 
     if (do_irq) {
         irq_vector = sh_intc_get_pending_vector(env->intc_handle,
-                                                (env->sr >> 4) & 0xf);
+                                                (env->sr >> 4) & 0xf,
+                                                &irq_priority);
         if (irq_vector == -1) {
             return; /* masked */
         }

@@ -77,26 +77,38 @@ static void sh_intc_set_irq(void *opaque, int n, int level)
     }
 }
 
-int sh_intc_get_pending_vector(struct intc_desc *desc, int imask)
+int sh_intc_get_pending_vector(struct intc_desc *desc, int imask,
+                               int *priority)
 {
-    unsigned int i;
-
     /* slow: use a linked lists of pending sources instead */
-    /* wrong: take interrupt priority into account (one list per priority) */
+    unsigned int i;
+    int best_prio = imask;
+    int best_vect = -1;
 
-    if (imask == 0x0f) {
-        return -1; /* FIXME, update code to include priority per source */
-    }
-
+    /*
+     * An interrupt is only accepted when its priority is strictly greater
+     * than SR.IMASK, and of those the highest priority wins. Returning the
+     * first pending source regardless of priority lets a low priority
+     * interrupt pre-empt a handler that deliberately raised IMASK to block
+     * it, which reaches the guest as an interrupt storm.
+     */
     for (i = 0; i < desc->nr_sources; i++) {
         struct intc_source *source = &desc->sources[i];
 
-        if (source->pending) {
-            trace_sh_intc_pending(desc->pending, source->vect);
-            return source->vect;
+        if (source->pending && source->priority > best_prio) {
+            best_prio = source->priority;
+            best_vect = source->vect;
         }
     }
-    g_assert_not_reached();
+
+    if (best_vect == -1) {
+        return -1; /* all pending sources are masked by SR.IMASK */
+    }
+    if (priority) {
+        *priority = best_prio;
+    }
+    trace_sh_intc_pending(desc->pending, best_vect);
+    return best_vect;
 }
 
 typedef enum {
@@ -107,6 +119,7 @@ typedef enum {
     INTC_MODE_MASK_REG,
 } SHIntCMode;
 #define INTC_MODE_IS_PRIO 0x80
+#define INTC_MODE_IS_INVERTED 0x40
 
 static SHIntCMode sh_intc_mode(unsigned long address, unsigned long set_reg,
                                unsigned long clr_reg)
@@ -140,7 +153,7 @@ static void sh_intc_locate(struct intc_desc *desc,
 
             mode = sh_intc_mode(address, mr->set_reg, mr->clr_reg);
             if (mode != INTC_MODE_NONE) {
-                *modep = mode;
+                *modep = mode | (mr->inverted ? INTC_MODE_IS_INVERTED : 0);
                 *datap = &mr->value;
                 *enums = mr->enum_ids;
                 *first = mr->reg_width - 1;
@@ -166,6 +179,21 @@ static void sh_intc_locate(struct intc_desc *desc,
         }
     }
     g_assert_not_reached();
+}
+
+/* Record a priority against a source, following group chains as masks do. */
+static void sh_intc_set_priority(struct intc_desc *desc, intc_enum id,
+                                 int priority, int is_group)
+{
+    struct intc_source *source = &desc->sources[id];
+
+    if (!id) {
+        return;
+    }
+    source->priority = priority;
+    if ((is_group || !source->vect) && source->next_enum_id) {
+        sh_intc_set_priority(desc, source->next_enum_id, priority, 1);
+    }
 }
 
 static void sh_intc_toggle_mask(struct intc_desc *desc, intc_enum id,
@@ -206,6 +234,14 @@ static uint64_t sh_intc_read(void *opaque, hwaddr offset, unsigned size)
 
     sh_intc_locate(desc, (unsigned long)offset, &valuep,
                    &enum_ids, &first, &width, &mode);
+    if (mode & INTC_MODE_IS_INVERTED) {
+        /* Invert within the register width, not the host word width. */
+        unsigned long reg_mask = MAKE_64BIT_MASK(0, (first + 1) * width);
+        unsigned long masked = ~*valuep & reg_mask;
+
+        trace_sh_intc_read(size, (uint64_t)offset, masked);
+        return masked;
+    }
     trace_sh_intc_read(size, (uint64_t)offset, *valuep);
     return *valuep;
 }
@@ -225,7 +261,7 @@ static void sh_intc_write(void *opaque, hwaddr offset,
     trace_sh_intc_write(size, (uint64_t)offset, value);
     sh_intc_locate(desc, (unsigned long)offset, &valuep,
                    &enum_ids, &first, &width, &mode);
-    switch (mode) {
+    switch (mode & ~INTC_MODE_IS_INVERTED) {
     case INTC_MODE_ENABLE_REG | INTC_MODE_IS_PRIO:
         break;
     case INTC_MODE_DUAL_SET:
@@ -245,6 +281,10 @@ static void sh_intc_write(void *opaque, hwaddr offset,
         if ((*valuep & mask) != (value & mask)) {
             sh_intc_toggle_mask(desc, enum_ids[k], value & mask, 0);
         }
+        if (mode & INTC_MODE_IS_PRIO) {
+            sh_intc_set_priority(desc, enum_ids[k],
+                                 (value & mask) >> ((first - k) * width), 0);
+        }
     }
 
     *valuep = value;
@@ -255,6 +295,28 @@ static const MemoryRegionOps sh_intc_ops = {
     .write = sh_intc_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
+
+/* How many mask or priority registers gate this enum id. */
+static unsigned int sh_intc_gate_count(struct intc_desc *desc, intc_enum id)
+{
+    unsigned int i, k, count = 0;
+
+    for (i = 0; i < desc->nr_mask_regs; i++) {
+        for (k = 0; k < ARRAY_SIZE(desc->mask_regs[i].enum_ids); k++) {
+            if (desc->mask_regs[i].enum_ids[k] == id) {
+                count++;
+            }
+        }
+    }
+    for (i = 0; i < desc->nr_prio_regs; i++) {
+        for (k = 0; k < ARRAY_SIZE(desc->prio_regs[i].enum_ids); k++) {
+            if (desc->prio_regs[i].enum_ids[k] == id) {
+                count++;
+            }
+        }
+    }
+    return count ? count : 1;
+}
 
 static void sh_intc_register_source(struct intc_desc *desc,
                                     intc_enum source,
@@ -297,7 +359,17 @@ static void sh_intc_register_source(struct intc_desc *desc,
             for (k = 0; k < ARRAY_SIZE(gr->enum_ids); k++) {
                 id = gr->enum_ids[k];
                 if (id && id == source) {
-                    desc->sources[id].enable_max++;
+                    /*
+                     * Enabling a group walks its members and bumps each one,
+                     * so a member has to expect one enable per register that
+                     * gates the group, not just one per group it belongs to.
+                     * Controllers that gate a module from both a mask
+                     * register and a priority register - the SH7764's INT2
+                     * does - would otherwise drive enable_count past
+                     * enable_max and the source could never become pending.
+                     */
+                    desc->sources[id].enable_max +=
+                        sh_intc_gate_count(desc, gr->enum_id);
                 }
             }
         }
@@ -401,6 +473,8 @@ int sh_intc_init(MemoryRegion *sysmem,
     desc->sources = g_new0(struct intc_source, nr_sources);
     for (i = 0; i < nr_sources; i++) {
         desc->sources[i].parent = desc;
+        /* Above the 4-bit SR.IMASK until a priority register says otherwise. */
+        desc->sources[i].priority = 0x10;
     }
     desc->irqs = qemu_allocate_irqs(sh_intc_set_irq, desc, nr_sources);
     memory_region_init_io(&desc->iomem, NULL, &sh_intc_ops, desc, "intc",
