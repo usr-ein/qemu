@@ -86,6 +86,21 @@ static void sh_serial_clear_fifo(SHSerialState *s)
     s->rx_tail = 0;
 }
 
+/*
+ * TXI is level driven by the transmit-FIFO-empty condition gated by TIE, not
+ * by TIE alone. Asserting it once when the guest sets TIE and only dropping it
+ * when TIE is cleared means a driver that acknowledges the interrupt by
+ * clearing TDFE never sees the line go low, and re-enters its handler forever.
+ */
+static void sh_serial_update_txi(SHSerialState *s)
+{
+    if (!(s->feat & SH_SERIAL_FEAT_SCIF) || !s->txi) {
+        return;
+    }
+    qemu_set_irq(s->txi, (s->scr & (1 << 7)) &&
+                         (s->flags & SH_SERIAL_FLAG_TDE) ? 1 : 0);
+}
+
 static void sh_serial_write(void *opaque, hwaddr offs,
                             uint64_t val, unsigned size)
 {
@@ -107,9 +122,7 @@ static void sh_serial_write(void *opaque, hwaddr offs,
         if (!(val & (1 << 5))) {
             s->flags |= SH_SERIAL_FLAG_TEND;
         }
-        if ((s->feat & SH_SERIAL_FEAT_SCIF) && s->txi) {
-            qemu_set_irq(s->txi, val & (1 << 7));
-        }
+        sh_serial_update_txi(s);
         if (!(val & (1 << 6))) {
             qemu_set_irq(s->rxi, 0);
         }
@@ -125,6 +138,15 @@ static void sh_serial_write(void *opaque, hwaddr offs,
         }
         s->dr = val;
         s->flags &= ~SH_SERIAL_FLAG_TDE;
+        if (s->feat & SH_SERIAL_FEAT_SCIF) {
+            /*
+             * The transmit path above is synchronous: by the time the write
+             * returns the byte has already reached the backend, so the FIFO
+             * is empty again and both status bits are set once more.
+             */
+            s->flags |= SH_SERIAL_FLAG_TDE | SH_SERIAL_FLAG_TEND;
+        }
+        sh_serial_update_txi(s);
         return;
 #if 0
     case 0x14: /* FRDR / RDR */
@@ -135,18 +157,23 @@ static void sh_serial_write(void *opaque, hwaddr offs,
     if (s->feat & SH_SERIAL_FEAT_SCIF) {
         switch (offs) {
         case 0x10: /* FSR */
-            if (!(val & (1 << 6))) {
-                s->flags &= ~SH_SERIAL_FLAG_TEND;
-            }
-            if (!(val & (1 << 5))) {
-                s->flags &= ~SH_SERIAL_FLAG_TDE;
-            }
+            /*
+             * TDFE and TEND are deliberately not cleared here. Writing 0 to
+             * TDFE has no effect while the transmit FIFO holds fewer bytes
+             * than the trigger number, and this model's transmitter is
+             * synchronous, so the FIFO is always empty and both bits stay
+             * set. Honouring the write instead deadlocks any driver that
+             * clears the status register before enabling TIE: TDFE would
+             * never come back on its own and the transmit interrupt would
+             * never be raised.
+             */
             if (!(val & (1 << 4))) {
                 s->flags &= ~SH_SERIAL_FLAG_BRK;
             }
             if (!(val & (1 << 1))) {
                 s->flags &= ~SH_SERIAL_FLAG_RDF;
             }
+            sh_serial_update_txi(s);
             if (!(val & (1 << 0))) {
                 s->flags &= ~SH_SERIAL_FLAG_DR;
             }
@@ -256,6 +283,7 @@ static uint64_t sh_serial_read(void *opaque, hwaddr offs,
 
             if (s->scr & (1 << 5)) {
                 s->flags |= SH_SERIAL_FLAG_TDE | SH_SERIAL_FLAG_TEND;
+                sh_serial_update_txi(s);
             }
 
             break;
