@@ -41,11 +41,11 @@
 #include "target/sh4/cpu.h"
 
 /*
- * Area 3 external bus, still unidentified. Once the application is running it
- * both reads sequentially from 0x0c000000 (memory-like) and repeatedly DMAs
- * blocks to a *fixed* 0x0c080000 (port-like), so we deliberately do not claim
- * which it is. Backing it with RAM was tried and changed nothing, so it is not
- * the current blocker. Stubbed so the accesses show up under `-d unimp`.
+ * Area 3. The SH7764 address map gives area 3 to 64 MB of SRAM, and the
+ * firmware treats it that way: once running it reads all 8388608 eight-byte
+ * words of the window in sequence, which is a memory scan, not a device
+ * probe. It also DMAs blocks to a fixed 0x0c080000, presumably a mailbox for
+ * the separate GUI processor, but that lands in the same memory.
  */
 #define CDJ2KNXS_EXTBUS_BASE    0x0c000000
 #define CDJ2KNXS_EXTBUS_SIZE    (64 * MiB)
@@ -77,6 +77,7 @@ static void cdj2knxs_init(MachineState *machine)
     MemoryRegion *sysmem = get_system_memory();
     MemoryRegion *dram = g_new(MemoryRegion, 1);
     MemoryRegion *flash = g_new(MemoryRegion, 1);
+    MemoryRegion *area3 = g_new(MemoryRegion, 1);
     ResetData *reset_info;
     SuperHCPU *cpu;
     DeviceState *soc;
@@ -117,8 +118,9 @@ static void cdj2knxs_init(MachineState *machine)
         exit(1);
     }
 
-    create_unimplemented_device("cdj2knxs.area3", CDJ2KNXS_EXTBUS_BASE,
-                                CDJ2KNXS_EXTBUS_SIZE);
+    memory_region_init_ram(area3, NULL, "cdj2knxs.area3",
+                           CDJ2KNXS_EXTBUS_SIZE, &error_fatal);
+    memory_region_add_subregion(sysmem, CDJ2KNXS_EXTBUS_BASE, area3);
 
     soc = qdev_new(TYPE_SH7764);
     object_property_set_link(OBJECT(soc), "cpu", OBJECT(cpu), &error_fatal);
