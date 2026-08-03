@@ -279,6 +279,16 @@ F: tests/tcg/loongarch64/
 F: tests/functional/loongarch64/meson.build
 F: tests/functional/loongarch64/test_virt.py
 
+Blackfin TCG CPUs
+M: qemu-devel@nongnu.org
+S: Orphan
+F: target/bfin/
+F: hw/bfin/
+F: include/hw/bfin/
+F: configs/devices/bfin-softmmu/
+F: configs/targets/bfin-softmmu.mak
+F: gdbstub/gdb-xml/bfin-core.xml
+
 M68K TCG CPUs
 M: Laurent Vivier <laurent@vivier.eu>
 S: Maintained

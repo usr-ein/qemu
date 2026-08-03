@@ -1,0 +1,160 @@
+# Analog Devices Blackfin 16-bit instruction encodings
+#
+# Copyright (c) 2026 cdj2knxs contributors
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Encodings are from the Blackfin Processor Programming Reference rev 2.2,
+# appendix C, tables C-5 to C-22. A 16-bit opcode is anything whose top two
+# bits are not both set; see translate.c for the length rules.
+#
+# Field order in this file follows the manual's bit diagrams exactly, so each
+# pattern can be checked against the corresponding table row.
+
+####
+# Program flow control, table C-9
+####
+
+nop             0000 0000 0000 0000
+
+rts             0000 0000 0001 0000
+rti             0000 0000 0001 0001
+rtx             0000 0000 0001 0010
+rtn             0000 0000 0001 0011
+rte             0000 0000 0001 0100
+
+idle            0000 0000 0010 0000
+csync           0000 0000 0010 0011
+ssync           0000 0000 0010 0100
+emuexcpt        0000 0000 0010 0101
+
+cli             0000 0000 0011 0 rd:3
+sti             0000 0000 0100 0 rd:3
+jump_p          0000 0000 0101 0 pb:3
+call_p          0000 0000 0110 0 pb:3
+call_pc_p       0000 0000 0111 0 pb:3
+jump_pc_p       0000 0000 1000 0 pb:3
+
+raise           0000 0000 1001 imm:4
+excpt           0000 0000 1010 imm:4
+
+# Conditional branch. Bit 11 is the CC sense and bit 10 the branch predict
+# hint; the manual's table transposes two of these four rows, so the ranges
+# there read 0x1800-0x17FF. The bit assignment is authoritative.
+if_ncc_jump     0001 00 off:s10
+if_ncc_jump_bp  0001 01 off:s10
+if_cc_jump      0001 10 off:s10
+if_cc_jump_bp   0001 11 off:s10
+
+jump_s          0010 off:s12
+
+####
+# Move, table C-12. Register group and number per table C-4.
+####
+
+movereg         0011 dg:3 sg:3 dn:3 sn:3
+
+####
+# Control code bit management, table C-14
+####
+
+cc_eq_dreg      0000 1000 00 src:3 dst:3
+cc_lt_dreg      0000 1000 10 src:3 dst:3
+cc_le_dreg      0000 1001 00 src:3 dst:3
+cc_ltu_dreg     0000 1000 11 src:3 dst:3
+cc_leu_dreg     0000 1001 01 src:3 dst:3
+
+cc_eq_imm       0000 1100 00 imm:s3 dst:3
+cc_lt_imm       0000 1100 10 imm:s3 dst:3
+cc_le_imm       0000 1101 00 imm:s3 dst:3
+
+mov_cc_dreg     0000 0010 0000 0 rd:3
+mov_dreg_cc     0000 0010 0000 1 rd:3
+cc_not          0000 0010 0001 1000
+
+####
+# Load immediate, table C-10
+####
+
+ldimm_d7        0110 00 imm:s7 rd:3
+addimm_d7       0110 01 imm:s7 rd:3
+ldimm_p7        0110 10 imm:s7 rd:3
+addimm_p7       0110 11 imm:s7 rd:3
+
+####
+# Load and store with a pointer, table C-10.
+# uimm6m4 and uimm5m2 are stored pre-divided by their alignment.
+####
+
+ld_d_p          1001 0001 00 pb:3 rd:3
+ld_p_p          1001 0001 01 pb:3 rd:3
+st_p_d          1001 0011 00 pb:3 rs:3
+st_p_p          1001 0011 01 pb:3 rs:3
+
+ld_d_pp         1001 0000 00 pb:3 rd:3
+ld_p_pp         1001 0000 01 pb:3 rd:3
+ld_d_pd         1001 0000 10 pb:3 rd:3
+ld_p_pd         1001 0000 11 pb:3 rd:3
+st_pp_d         1001 0010 00 pb:3 rs:3
+st_pp_p         1001 0010 01 pb:3 rs:3
+st_pd_d         1001 0010 10 pb:3 rs:3
+st_pd_p         1001 0010 11 pb:3 rs:3
+
+# Indexed forms. The manual notes that when the two pointer fields name the
+# same register the encoding is the plain [Preg] version, and only when they
+# differ does the pointer advance by the index register. One pattern each,
+# with the distinction made in the translator.
+ldw_pi_d_z      1000 011 rd:3 pi:3 pb:3
+st_pi_d         1000 100 rs:3 pi:3 pb:3
+stw_pi_dl       1000 101 rs:3 pi:3 pb:3
+stw_pi_dh       1000 110 rs:3 pi:3 pb:3
+ldw_pi_d_x      1000 111 rd:3 pi:3 pb:3
+
+# Access through an index register. These are the DAG forms; the post-modify
+# versions advance by M0 implicitly (by four for a word access), and circular
+# addressing applies when the matching L register is nonzero.
+ld_d_i          1001 1101 000 ireg:2 rd:3
+ldw_dl_i        1001 1101 001 ireg:2 rd:3
+ld_d_ip         1001 1100 000 ireg:2 rd:3
+ldw_dl_ip       1001 1100 001 ireg:2 rd:3
+st_i_d          1001 1111 000 ireg:2 rs:3
+st_ip_d         1001 1110 000 ireg:2 rs:3
+
+# Push and pop of a single register, using the 6-bit core register encoding
+# of table C-4.
+pop_reg         0000 0001 00 reg:6
+push_reg        0000 0001 01 reg:6
+
+ld_d_p_off      1010 00 off:4 pb:3 rd:3
+ld_p_p_off      1010 11 off:4 pb:3 rd:3
+st_p_off_d      1011 00 off:4 pb:3 rs:3
+st_p_off_p      1011 11 off:4 pb:3 rs:3
+
+ldw_d_p_off_z   1010 01 off:4 pb:3 rd:3
+ldw_d_p_off_x   1010 10 off:4 pb:3 rd:3
+stw_p_off_d     1011 01 off:4 pb:3 rs:3
+
+####
+# Arithmetic, tables C-17 and C-19
+####
+
+add_d_d         0101 000 src2:3 src1:3 dst:3
+sub_d_d         0101 001 src2:3 src1:3 dst:3
+and_d_d         0101 010 src2:3 src1:3 dst:3
+or_d_d          0101 011 src2:3 src1:3 dst:3
+xor_d_d         0101 100 src2:3 src1:3 dst:3
+
+shl_p1          0101 101 src2:3 src1:3 dst:3
+add_p_p2        0101 111 src2:3 src1:3 dst:3
+
+####
+# Shift and bit operations with an immediate, tables C-15 and C-16
+####
+
+bittst_n        0100 1000 imm:5 rd:3
+bittst          0100 1001 imm:5 rd:3
+bitset          0100 1010 imm:5 rd:3
+bittgl          0100 1011 imm:5 rd:3
+bitclr          0100 1100 imm:5 rd:3
+asr_imm         0100 1101 imm:5 rd:3
+lsr_imm         0100 1110 imm:5 rd:3
+lsl_imm         0100 1111 imm:5 rd:3

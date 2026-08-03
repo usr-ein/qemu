@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+config BF531
+    bool
+    select UNIMP
+
+config CDJ2KNXS_GUI
+    bool
+    default y
+    depends on BFIN
+    select BF531

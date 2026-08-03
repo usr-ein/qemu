@@ -1,0 +1,66 @@
+<?xml version="1.0"?>
+<!-- Copyright (c) 2026 cdj2knxs contributors
+
+     Copying and distribution of this file, with or without modification,
+     are permitted in any medium without royalty provided the copyright
+     notice and this notice are preserved.
+
+     Register order matches gdb's own bfin-tdep.c.  -->
+
+<!DOCTYPE feature SYSTEM "gdb-target.dtd">
+<feature name="org.gnu.gdb.bfin.core">
+  <reg name="r0" bitsize="32"/>
+  <reg name="r1" bitsize="32"/>
+  <reg name="r2" bitsize="32"/>
+  <reg name="r3" bitsize="32"/>
+  <reg name="r4" bitsize="32"/>
+  <reg name="r5" bitsize="32"/>
+  <reg name="r6" bitsize="32"/>
+  <reg name="r7" bitsize="32"/>
+  <reg name="p0" bitsize="32" type="data_ptr"/>
+  <reg name="p1" bitsize="32" type="data_ptr"/>
+  <reg name="p2" bitsize="32" type="data_ptr"/>
+  <reg name="p3" bitsize="32" type="data_ptr"/>
+  <reg name="p4" bitsize="32" type="data_ptr"/>
+  <reg name="p5" bitsize="32" type="data_ptr"/>
+  <reg name="sp" bitsize="32" type="data_ptr"/>
+  <reg name="fp" bitsize="32" type="data_ptr"/>
+  <reg name="i0" bitsize="32" type="data_ptr"/>
+  <reg name="i1" bitsize="32" type="data_ptr"/>
+  <reg name="i2" bitsize="32" type="data_ptr"/>
+  <reg name="i3" bitsize="32" type="data_ptr"/>
+  <reg name="m0" bitsize="32"/>
+  <reg name="m1" bitsize="32"/>
+  <reg name="m2" bitsize="32"/>
+  <reg name="m3" bitsize="32"/>
+  <reg name="b0" bitsize="32" type="data_ptr"/>
+  <reg name="b1" bitsize="32" type="data_ptr"/>
+  <reg name="b2" bitsize="32" type="data_ptr"/>
+  <reg name="b3" bitsize="32" type="data_ptr"/>
+  <reg name="l0" bitsize="32"/>
+  <reg name="l1" bitsize="32"/>
+  <reg name="l2" bitsize="32"/>
+  <reg name="l3" bitsize="32"/>
+  <reg name="a0x" bitsize="32"/>
+  <reg name="a0w" bitsize="32"/>
+  <reg name="a1x" bitsize="32"/>
+  <reg name="a1w" bitsize="32"/>
+  <reg name="astat" bitsize="32"/>
+  <reg name="rets" bitsize="32" type="code_ptr"/>
+  <reg name="lc0" bitsize="32"/>
+  <reg name="lt0" bitsize="32" type="code_ptr"/>
+  <reg name="lb0" bitsize="32" type="code_ptr"/>
+  <reg name="lc1" bitsize="32"/>
+  <reg name="lt1" bitsize="32" type="code_ptr"/>
+  <reg name="lb1" bitsize="32" type="code_ptr"/>
+  <reg name="cycles" bitsize="32"/>
+  <reg name="cycles2" bitsize="32"/>
+  <reg name="usp" bitsize="32" type="data_ptr"/>
+  <reg name="seqstat" bitsize="32"/>
+  <reg name="syscfg" bitsize="32"/>
+  <reg name="reti" bitsize="32" type="code_ptr"/>
+  <reg name="retx" bitsize="32" type="code_ptr"/>
+  <reg name="retn" bitsize="32" type="code_ptr"/>
+  <reg name="rete" bitsize="32" type="code_ptr"/>
+  <reg name="pc" bitsize="32" type="code_ptr"/>
+</feature>

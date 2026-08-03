@@ -1,0 +1,65 @@
+# Analog Devices Blackfin 32-bit instruction encodings
+#
+# Copyright (c) 2026 cdj2knxs contributors
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Encodings are from the Blackfin Processor Programming Reference rev 2.2,
+# appendix C, table C-23. A 32-bit opcode is one whose first word has both
+# top bits set; if bit 11 of that word is also set the instruction is 64 bits
+# and carries two 16-bit slots after it, which translate.c handles separately.
+
+####
+# Zero overhead loop setup, table C-9.
+#
+# The start offset is pcrel5m2 and the end offset pcrel11m2, both stored
+# pre-divided by two. LC0 and LC1 select which of the two loop register sets
+# is programmed; the Preg forms take the trip count from a pointer register.
+####
+
+lsetup0         1110 0000 1000 spc:4    000000 epc:10
+lsetup1         1110 0000 1001 spc:4    000000 epc:10
+lsetup0_p       1110 0000 1010 spc:4    preg:4 00 epc:10
+lsetup1_p       1110 0000 1011 spc:4    preg:4 00 epc:10
+
+####
+# Load immediate, table C-10.
+#
+# The 5-bit register field is the "all registers" encoding of table C-4:
+# 0-7 R0-R7, 8-15 P0-P5/SP/FP, 16-23 I0-I3/M0-M3, 24-31 B0-B3/L0-L3.
+####
+
+ldimm_lo        1110 0001 000 reg:5     imm:16
+ldimm_x         1110 0001 001 reg:5     imm:16
+ldimm_hi        1110 0001 010 reg:5     imm:16
+ldimm_z         1110 0001 100 reg:5     imm:16
+
+####
+# Direct branches, table C-9. pcrel25m2 is split with its most significant
+# bits in the first word and the rest, divided by two, in the second.
+####
+
+jump_l          1110 0010 hi:8          lo:16
+call_l          1110 0011 hi:8          lo:16
+
+####
+# Load and store with a large displacement, table C-10.
+#
+# The word forms scale the displacement by four and the byte forms do not.
+# The manual names these uimm17m4 and uimm15 and gives separate rows for the
+# add and subtract spellings; the encoded displacement is signed, so one
+# pattern covers both.
+####
+
+ld_d_p_off17    1110 0100 00 pb:3 rd:3  off:s16
+ld_db_p_off     1110 0100 10 pb:3 rd:3  off:s16
+ld_p_p_off17    1110 0101 00 pb:3 rd:3  off:s16
+st_p_off17_d    1110 0110 00 pb:3 rs:3  off:s16
+st_pb_off_d     1110 0110 10 pb:3 rs:3  off:s16
+st_p_off17_p    1110 0111 00 pb:3 rs:3  off:s16
+
+####
+# Stack frame management, table C-13
+####
+
+link            1110 1000 0000 0000     imm:16
+unlink          1110 1000 0000 0001     0000 0000 0000 0000
