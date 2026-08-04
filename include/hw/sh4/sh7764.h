@@ -121,6 +121,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SH7764State, SH7764)
 
 #define SH7764_CHCR_DE          (1u << 0)   /* enable                         */
 #define SH7764_CHCR_TE          (1u << 1)   /* transfer end                   */
+#define SH7764_CHCR_IE          (1u << 2)   /* interrupt on transfer end      */
 /* Transfer size is TS[1:0] at bits 4 and 3 with TS[2] stranded at bit 20. */
 #define SH7764_CHCR_TS_SHIFT    3
 #define SH7764_CHCR_TS_MASK     0x3
@@ -177,6 +178,8 @@ struct SH7764State {
     MemoryRegion sdhi;
     MemoryRegion iic;
     uint8_t iic_regs[SH7764_IIC_SIZE / 4];
+    MemoryRegion int2b3;
+    MemoryRegion int2b3_p4;
     MemoryRegion int2b4;
     MemoryRegion int2b4_p4;
     DeviceState *eth;
@@ -216,7 +219,7 @@ struct SH7764State {
      * jog wheel and the rotary encoder. See the panel section.
      */
     CharFrontend panel_chr;
-    uint8_t panel_rx_buf[SH7764_PANEL_FRAME];
+    uint8_t panel_rx_buf[SH7764_PANEL_FRAME * 4];
     uint32_t panel_rx_len;
     int32_t panel_rx_chan;              /* DMA channel armed on SCIF2 RX    */
 

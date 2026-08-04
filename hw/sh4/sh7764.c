@@ -98,6 +98,7 @@ static int sh7764_dma_step(uint32_t chcr, int shift, unsigned unit)
     }
 }
 
+static void sh7764_dma_update_irq(SH7764State *s);
 static bool sh7764_panel_channel(SH7764State *s, int ch, bool tx);
 static void sh7764_panel_deliver(SH7764State *s);
 static void sh7764_panel_send(SH7764State *s, int ch, uint32_t count);
@@ -181,6 +182,19 @@ static void sh7764_dma_run(SH7764State *s, int ch)
     s->dar[ch] = dst;
     s->tcr[ch] = 0;
     s->chcr[ch] |= SH7764_CHCR_TE;
+}
+
+/*
+ * The DMAC's channel 1 interrupt. It is a level: the controller holds it while
+ * the channel's transfer-end flag stands and the service routine drops it by
+ * clearing that flag, which is what INT2B3 reports to the routine as well.
+ */
+static void sh7764_dma_update_irq(SH7764State *s)
+{
+    bool pending = (s->chcr[1] & SH7764_CHCR_TE) &&
+                   (s->chcr[1] & SH7764_CHCR_IE);
+
+    qemu_set_irq(s->intc.irqs[DMINT1], pending);
 }
 
 /* Channel for a register offset, or -1 if the offset is not a channel's. */
@@ -292,6 +306,7 @@ static void sh7764_dmac_write(void *opaque, hwaddr offset, uint64_t value,
         case SH7764_DMAC_CHCR:
             s->chcr[ch] = value;
             sh7764_dma_run(s, ch);
+            sh7764_dma_update_irq(s);
             break;
         }
         return;
@@ -1206,6 +1221,35 @@ static void sh7764_int2b4_write(void *opaque, hwaddr offset, uint64_t value,
     /* Read only. */
 }
 
+/*
+ * INT2B3, the DMAC's detailed source register. One bit per channel, set while
+ * that channel has finished and its transfer-end flag is still standing. The
+ * firmware's DMA service routine at 0x0429abe0 reads this first and leaves
+ * immediately unless the bit for the channel it cares about is set, so
+ * without it the routine bails before it ever looks at the channel.
+ */
+static uint64_t sh7764_int2b3_read(void *opaque, hwaddr offset, unsigned size)
+{
+    SH7764State *s = opaque;
+    uint32_t val = 0;
+    int ch;
+
+    for (ch = 0; ch < SH7764_DMAC_NCHAN; ch++) {
+        if (s->chcr[ch] & SH7764_CHCR_TE) {
+            val |= 1u << ch;
+        }
+    }
+    return val;
+}
+
+static const MemoryRegionOps sh7764_int2b3_ops = {
+    .read = sh7764_int2b3_read,
+    .write = sh7764_int2b4_write,       /* read only, same as INT2B4 */
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
 static const MemoryRegionOps sh7764_int2b4_ops = {
     .read = sh7764_int2b4_read,
     .write = sh7764_int2b4_write,
@@ -1369,9 +1413,23 @@ static void sh7764_panel_deliver(SH7764State *s)
         return;                         /* nothing armed; hold the frame */
     }
 
-    len = s->tcr[ch] ? s->tcr[ch] : sizeof(s->panel_rx_buf);
+    len = s->tcr[ch] ? s->tcr[ch] : SH7764_PANEL_FRAME;
     if (s->panel_rx_len < len) {
         return;                         /* wait for the whole frame */
+    }
+
+    /*
+     * The panel reports a state, not a stream: it sends the same frame over
+     * and over and only the latest is worth having. If several piled up while
+     * nothing was armed, take the newest and drop the rest, so the firmware
+     * never works through a backlog of stale button positions.
+     */
+    if (s->panel_rx_len >= 2 * len) {
+        uint32_t skip = (s->panel_rx_len / len - 1) * len;
+
+        memmove(s->panel_rx_buf, s->panel_rx_buf + skip,
+                s->panel_rx_len - skip);
+        s->panel_rx_len -= skip;
     }
 
     address_space_write(&address_space_memory, sh7764_dma_addr(s->dar[ch]),
@@ -1387,7 +1445,13 @@ static void sh7764_panel_deliver(SH7764State *s)
     s->dar[ch] += len;
     s->chcr[ch] = (s->chcr[ch] | SH7764_CHCR_TE) & ~SH7764_CHCR_DE;
     s->panel_rx_chan = -1;
-    qemu_irq_pulse(s->intc.irqs[DMINT1]);
+    /*
+     * The buffer is only a few frames deep, so it fills while nothing is
+     * armed and the front end stops offering bytes. Draining it is not
+     * enough on its own; the flow has to be restarted by hand.
+     */
+    qemu_chr_fe_accept_input(&s->panel_chr);
+    sh7764_dma_update_irq(s);
 }
 
 static void sh7764_panel_receive(void *opaque, const uint8_t *buf, int size)
@@ -1419,18 +1483,12 @@ static void sh7764_panel_send(SH7764State *s, int ch, uint32_t count)
     s->sar[ch] += len;
     s->tcr[ch] = 0;
     s->chcr[ch] = (s->chcr[ch] | SH7764_CHCR_TE) & ~SH7764_CHCR_DE;
-    qemu_irq_pulse(s->intc.irqs[DMINT1]);
+    sh7764_dma_update_irq(s);
 }
 
 /* True if this channel is the panel link, in the given direction. */
 static bool sh7764_panel_channel(SH7764State *s, int ch, bool tx)
 {
-    uint32_t chcr = s->chcr[ch];
-    unsigned rs = (chcr >> SH7764_CHCR_RS_SHIFT) & SH7764_CHCR_RS_MASK;
-
-    if (rs != SH7764_CHCR_RS_DMARS) {
-        return false;
-    }
     return tx ? s->dar[ch] == SH7764_SCIF2_SCFTDR
               : s->sar[ch] == SH7764_SCIF2_SCFRDR;
 }
@@ -1715,6 +1773,13 @@ static void sh7764_realize(DeviceState *dev, Error **errp)
     memory_region_init_alias(&s->int2b4_p4, OBJECT(s), "sh7764.int2b4-p4",
                              &s->int2b4, 0, 4);
     memory_region_add_subregion(sysmem, 0xffd40050, &s->int2b4_p4);
+
+    memory_region_init_io(&s->int2b3, OBJECT(s), &sh7764_int2b3_ops, s,
+                          "sh7764.int2b3", 4);
+    memory_region_add_subregion(sysmem, 0x1fd4004c, &s->int2b3);
+    memory_region_init_alias(&s->int2b3_p4, OBJECT(s), "sh7764.int2b3-p4",
+                             &s->int2b3, 0, 4);
+    memory_region_add_subregion(sysmem, 0xffd4004c, &s->int2b3_p4);
     sh_intc_register_sources(&s->intc,
                              _INTC_ARRAY(sh7764_vectors),
                              _INTC_ARRAY(sh7764_groups));
