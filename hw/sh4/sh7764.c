@@ -799,6 +799,101 @@ static void sh7764_sdhi_write(void *opaque, hwaddr offset, uint64_t value,
     /* Nothing to do: there is no card behind this. */
 }
 
+/* ------------------------------------------------------------------ IIC */
+
+/*
+ * The I2C bus interface, section 16.3. Registers are one byte each, four
+ * bytes apart.
+ *
+ * Two bits of ICMCR are not storage at all: FSCL and FSDA read back the level
+ * on the two bus lines, and an idle I2C bus is held high by its pull-ups.
+ * Unmodelled the register reads zero, which says both lines are pulled down -
+ * a bus stuck busy - and the driver waits for it to go free before it will
+ * start a transfer. That wait is where the main firmware sat: a thousand reads
+ * of ICMCR and no way out of them.
+ *
+ * Nothing is attached to the bus here, so a transfer is answered the way real
+ * hardware answers one addressed to nobody. The address goes out and comes
+ * back unacknowledged, the driver sees MNR and gives up on that device rather
+ * than waiting on it forever.
+ */
+#define SH7764_IIC_ICMCR        0x04
+#define SH7764_IIC_ICMSR        0x0c
+
+#define SH7764_ICMCR_ESG        (1u << 0)   /* generate a start condition */
+#define SH7764_ICMCR_FSB        (1u << 1)   /* generate a stop condition  */
+#define SH7764_ICMCR_OBPC       (1u << 4)   /* software drives the pins   */
+#define SH7764_ICMCR_LINES      0x60        /* FSDA and FSCL, read as bus */
+
+#define SH7764_ICMSR_MAT        (1u << 0)   /* address transmitted        */
+#define SH7764_ICMSR_MST        (1u << 4)   /* stop transmitted           */
+#define SH7764_ICMSR_MNR        (1u << 6)   /* no acknowledge came back   */
+
+static uint64_t sh7764_iic_read(void *opaque, hwaddr offset, unsigned size)
+{
+    SH7764State *s = opaque;
+    unsigned idx = offset / 4;
+    uint8_t val;
+
+    if (idx >= ARRAY_SIZE(s->iic_regs)) {
+        return 0;
+    }
+    val = s->iic_regs[idx];
+
+    /*
+     * Unless software has taken the pins over, the two line bits show the bus
+     * itself, and an idle bus reads high.
+     */
+    if (offset == SH7764_IIC_ICMCR && !(val & SH7764_ICMCR_OBPC)) {
+        val |= SH7764_ICMCR_LINES;
+    }
+    trace_sh7764_bank_read("sh7764.iic", offset, val, size, sh7764_guest_pc());
+    return val;
+}
+
+static void sh7764_iic_write(void *opaque, hwaddr offset, uint64_t value,
+                             unsigned size)
+{
+    SH7764State *s = opaque;
+    unsigned idx = offset / 4;
+
+    if (idx >= ARRAY_SIZE(s->iic_regs)) {
+        return;
+    }
+    trace_sh7764_bank_write("sh7764.iic", offset, value, size,
+                            sh7764_guest_pc());
+
+    if (offset == SH7764_IIC_ICMSR) {
+        /* Table 16.2 note 3: a flag is cleared by writing zero over it. */
+        s->iic_regs[idx] &= value;
+        return;
+    }
+
+    s->iic_regs[idx] = value;
+
+    if (offset == SH7764_IIC_ICMCR) {
+        unsigned sr = SH7764_IIC_ICMSR / 4;
+
+        if (value & SH7764_ICMCR_ESG) {
+            /* The address goes out and nobody answers it. */
+            s->iic_regs[sr] |= SH7764_ICMSR_MAT | SH7764_ICMSR_MNR;
+            s->iic_regs[idx] &= ~SH7764_ICMCR_ESG;
+        }
+        if (value & SH7764_ICMCR_FSB) {
+            s->iic_regs[sr] |= SH7764_ICMSR_MST;
+            s->iic_regs[idx] &= ~SH7764_ICMCR_FSB;
+        }
+    }
+}
+
+static const MemoryRegionOps sh7764_iic_ops = {
+    .read = sh7764_iic_read,
+    .write = sh7764_iic_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
 static const MemoryRegionOps sh7764_sdhi_ops = {
     .read = sh7764_sdhi_read,
     .write = sh7764_sdhi_write,
@@ -1369,6 +1464,9 @@ static void sh7764_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->sdhi, OBJECT(s), &sh7764_sdhi_ops, s,
                           "sh7764.sdhi", SH7764_SDHI_SIZE);
     memory_region_add_subregion(sysmem, SH7764_SDHI_BASE, &s->sdhi);
+    memory_region_init_io(&s->iic, OBJECT(s), &sh7764_iic_ops, s,
+                          "sh7764.iic", SH7764_IIC_SIZE);
+    memory_region_add_subregion(sysmem, SH7764_IIC_BASE, &s->iic);
     sh7764_bank_init(s, &s->misc_a, "sh7764.misc-ffa0",
                      SH7764_MISC_A_BASE, SH7764_MISC_A_SIZE);
     memory_region_init_io(&s->cpuopm, OBJECT(s), &sh7764_cpuopm_ops, s,

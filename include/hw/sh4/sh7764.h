@@ -54,6 +54,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(SH7764State, SH7764)
 #define SH7764_SSI_B_BASE       0xff500000  /* serial sound interface B       */
 #define SH7764_SSI_SIZE         0x00008000
 #define SH7764_SDHI_BASE        0xffe40000  /* SD host interface (undoc.)     */
+#define SH7764_IIC_BASE         0xffe70000  /* I2C bus interface              */
+#define SH7764_IIC_SIZE         0x00000028
 #define SH7764_SDHI_SIZE        0x00010000
 #define SH7764_ATAPI_BASE       0xfff00000  /* ATAPI (the CD/DVD mechanism)   */
 #define SH7764_ATAPI_SIZE       0x00001000
@@ -144,6 +146,8 @@ struct SH7764State {
     SH7764RegBank ssi_a;
     SH7764RegBank ssi_b;
     MemoryRegion sdhi;
+    MemoryRegion iic;
+    uint8_t iic_regs[SH7764_IIC_SIZE / 4];
     MemoryRegion int2b4;
     MemoryRegion int2b4_p4;
     DeviceState *eth;
