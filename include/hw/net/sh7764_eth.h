@@ -50,6 +50,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SH7764EthState, SH7764_ETH)
  * frame was received, and a frame finished transmitting.
  */
 #define SH7764_EESR_FR          (1u << 18)
+#define SH7764_EESR_RDE         (1u << 17)   /* receive descriptor empty */
 /* ECI reflects EtherC's own status register, section 20.2.6 bit 22. */
 #define SH7764_EESR_ECI         (1u << 22)
 

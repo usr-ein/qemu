@@ -137,6 +137,30 @@ static void sh7764_eth_transmit(SH7764EthState *s)
     sh7764_eth_update_irq(s);
 }
 
+/*
+ * Section 20.2.3: on a write of 1 to EDRRR.RR the engine reads the current
+ * receive descriptor. If RACT is set it keeps running; if RACT is clear the
+ * list is exhausted, so it stops and drops RR. The driver polls RR to see
+ * that happen, so leaving the bit set forever hides an empty ring from it.
+ */
+static void sh7764_eth_rx_check(SH7764EthState *s)
+{
+    hwaddr desc;
+    uint32_t status;
+
+    if (!(s->edrrr & SH7764_EDRRR_RR) || !s->rdlar) {
+        return;
+    }
+
+    desc = sh7764_eth_addr(s->rdlar) + s->rx_cursor;
+    status = sh7764_eth_desc_read(desc, 0);
+    if (!(status & SH7764_DESC_ACT)) {
+        s->edrrr &= ~SH7764_EDRRR_RR;
+        s->eesr |= SH7764_EESR_RDE;
+        sh7764_eth_update_irq(s);
+    }
+}
+
 static bool sh7764_eth_can_receive(NetClientState *nc)
 {
     SH7764EthState *s = qemu_get_nic_opaque(nc);
@@ -188,6 +212,7 @@ static ssize_t sh7764_eth_receive(NetClientState *nc, const uint8_t *buf,
     trace_sh7764_eth_rx((uint32_t)desc, (uint32_t)size);
     s->eesr |= SH7764_EESR_FR;
     sh7764_eth_update_irq(s);
+    sh7764_eth_rx_check(s);
     return size;
 }
 
@@ -385,8 +410,14 @@ static uint64_t sh7764_eth_read_reg(SH7764EthState *s, hwaddr offset)
     case SH7764_ETH_MAHR:       return s->mahr;
     case SH7764_ETH_MALR:       return s->malr;
     case SH7764_ETH_PSR:
-        /* LMON: the link is always up, there is nothing to unplug. */
-        return 1;
+        /*
+         * LMON is the level of the LNKSTA pin, which the board ties to the
+         * PHY's LINK output. That output is active low, so a live link reads
+         * as zero - and the firmware agrees: ether_send transmits only when
+         * (PSR & 1) == 0 and otherwise fails with 0xfffffc17. Returning 1
+         * here reads as "cable unplugged" and stops it dead.
+         */
+        return 0;
     default:
         /*
          * The statistics counters and anything else unmodelled read as zero,
@@ -432,6 +463,7 @@ static void sh7764_eth_write(void *opaque, hwaddr offset, uint64_t val,
     case SH7764_ETH_EDRRR:
         s->edrrr = val;
         if (val & SH7764_EDRRR_RR) {
+            sh7764_eth_rx_check(s);
             qemu_flush_queued_packets(qemu_get_queue(s->nic));
         }
         break;
