@@ -46,8 +46,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(SH7764State, SH7764)
 
 #define SH7764_GPIO_BASE        0xfff10000  /* GPIO / pin function            */
 #define SH7764_GPIO_SIZE        0x00001000
-#define SH7764_PTDAT_C          0x0048
-#define SH7764_PTDAT_C_PTC2     (1u << 2)
 
 #define SH7764_INTC_BASE        0xffd00000  /* IRQ-side INTC registers        */
 #define SH7764_INTC_SIZE        0x00001000
@@ -234,7 +232,6 @@ struct SH7764State {
     uint8_t ssi_rx_buf[4096];
     uint32_t ssi_rx_len;
     bool ssi_rx_armed;
-    bool ssi_gui_answered;
 
     /* Optional write watch; see sh7764_watch_write. */
     MemoryRegion watch;
