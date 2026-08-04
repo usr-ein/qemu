@@ -110,6 +110,13 @@ struct SH7764EthState {
     uint32_t mdio_count;        /* how many have arrived                   */
     uint32_t mdio_data;         /* reply being shifted back out            */
     int mdio_state;
+    unsigned mdio_reg;
+
+    /* RTL8201FL PHY: paged register file, page selected by register 31. */
+    uint16_t phy_page;
+    uint16_t phy_bmcr;
+    uint16_t phy_page0[32];
+    uint16_t phy_page7[16];
 };
 
 #endif /* HW_NET_SH7764_ETH_H */

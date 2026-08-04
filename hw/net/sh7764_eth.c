@@ -189,73 +189,164 @@ static ssize_t sh7764_eth_receive(NetClientState *nc, const uint8_t *buf,
 #define PIR_MDO     (1u << 2)
 #define PIR_MDI     (1u << 3)
 
+/*
+ * The board's PHY is a Realtek RTL8201FL-VB-CG (IC704 in the service manual,
+ * fed by a 25 MHz clock). Its registers are paged: register 31 selects the
+ * page, registers 0 to 15 are the IEEE set and always visible, and 16 upward
+ * belong to whichever page is selected. The driver here selects page 7 and
+ * programs RMSR, the LED registers and the link-change interrupt, so those
+ * have to read back what was written or the read-modify-writes corrupt them.
+ */
+#define PHY_PAGE_SEL    31
+
 static uint16_t sh7764_eth_phy_read(SH7764EthState *s, unsigned reg)
 {
-    switch (reg) {
-    case 0:     /* BMCR: autonegotiation enabled, 100 Mbit, full duplex */
-        return 0x3100;
-    case 1:     /* BMSR: link up (bit 2), autoneg able (3) and done (5)  */
-        return 0x786d;
-    case 2:     /* PHY identifier, high                                   */
-        return 0x0022;
-    case 3:     /* PHY identifier, low                                    */
-        return 0x1619;
-    case 4:     /* our advertisement                                      */
-        return 0x01e1;
-    case 5:     /* link partner ability, mirroring ours                   */
-        return 0x41e1;
+    if (reg == PHY_PAGE_SEL) {
+        return s->phy_page;
+    }
+
+    /* Registers 0 to 15 are the IEEE set and do not page. */
+    if (reg < 16) {
+        switch (reg) {
+        case 0:     /* BMCR */
+            return s->phy_bmcr;
+        case 1:
+            /*
+             * BMSR. Link up (bit 2), autonegotiation able (3) and complete
+             * (5), plus the 10/100 capability bits. The link bit latches low
+             * on the real part, but there is nothing here that can drop the
+             * link, so reporting it up on every read is accurate.
+             */
+            return 0x782d | (1 << 2) | (1 << 5);
+        case 2:     /* PHY identifier, RTL8201F */
+            return 0x001c;
+        case 3:
+            return 0xc816;
+        case 4:     /* our advertisement: 100/10, full and half duplex   */
+            return 0x01e1;
+        case 5:     /* link partner ability, same plus the ack bit       */
+            return 0x45e1;
+        case 6:     /* ANER: link partner is autonegotiation able        */
+            return 0x0001;
+        default:
+            return s->phy_page0[reg];
+        }
+    }
+
+    /* Paged registers. */
+    switch (s->phy_page) {
+    case 7:
+        return s->phy_page7[reg - 16];
     default:
-        return 0;
+        return s->phy_page0[reg];
     }
 }
+
+static void sh7764_eth_phy_write(SH7764EthState *s, unsigned reg, uint16_t val)
+{
+    if (reg == PHY_PAGE_SEL) {
+        s->phy_page = val;
+        return;
+    }
+    if (reg == 0) {
+        /* A reset request completes immediately; the bit reads back clear. */
+        s->phy_bmcr = val & ~0x8000;
+        return;
+    }
+    if (reg < 16) {
+        s->phy_page0[reg] = val;
+        return;
+    }
+    switch (s->phy_page) {
+    case 7:
+        s->phy_page7[reg - 16] = val;
+        break;
+    default:
+        s->phy_page0[reg] = val;
+        break;
+    }
+}
+
+/*
+ * One MDC cycle. Frame layout is Table 40 of the PHY datasheet:
+ *
+ *   read   preamble ST=01 OP=10 PHYAD(5) REGAD(5) TA=Z0 DATA(16)
+ *   write  preamble ST=01 OP=01 PHYAD(5) REGAD(5) TA=10 DATA(16)
+ *
+ * so REGAD is the low five bits of the thirteen that follow the leading zero
+ * of ST, not shifted by a turnaround that has not happened yet. Getting that
+ * wrong makes the guest appear to read a scatter of nonsense registers, which
+ * is exactly how this was found.
+ *
+ * PHYAD is ignored: this board has one PHY and the driver is written for it.
+ */
+enum {
+    MDIO_IDLE = 0,      /* preamble; waiting for the leading zero of ST */
+    MDIO_CMD,           /* 13 bits: ST0, OP, PHYAD, REGAD              */
+    MDIO_READ_OUT,      /* turnaround then 16 bits back to the guest   */
+    MDIO_WRITE_IN,      /* turnaround then 16 bits from the guest      */
+};
 
 static void sh7764_eth_mdio_clock(SH7764EthState *s, uint32_t val)
 {
     bool bit = val & PIR_MDO;
 
-    /*
-     * Frames are 32 preamble ones, then ST(2) OP(2) PHYAD(5) REGAD(5) TA(2)
-     * DATA(16). Rather than track the preamble, shift everything into a
-     * 32-bit window and look for the start pattern once enough has arrived.
-     */
-    if (val & PIR_MMD) {
-        s->mdio_shift = (s->mdio_shift << 1) | (bit ? 1 : 0);
-        if (s->mdio_count < 32) {
-            s->mdio_count++;
-        }
-
-        if (s->mdio_count >= 14 && ((s->mdio_shift >> 12) & 0x3) == 0x1) {
-            unsigned op = (s->mdio_shift >> 10) & 0x3;
-            /*
-             * A read frame is 14 bits before the turnaround: ST(2) OP(2)
-             * PHYAD(5) REGAD(5). REGAD is therefore the low five bits, not
-             * shifted by the two turnaround bits that have not arrived yet.
-             */
-            unsigned reg = s->mdio_shift & 0x1f;
-
-            if (op == 0x2) {    /* read */
-                s->mdio_data = sh7764_eth_phy_read(s, reg);
-                trace_sh7764_eth_mdio(reg, s->mdio_data);
-                s->mdio_state = 1;
-                s->mdio_count = 0;
-                s->mdio_shift = 0;
-            } else if (op == 0x1) {     /* write: accepted and discarded */
-                s->mdio_state = 0;
-                s->mdio_count = 0;
-                s->mdio_shift = 0;
-            }
-        }
-    } else if (s->mdio_state) {
-        /* Turnaround then 16 data bits, most significant first. */
-        s->pir &= ~PIR_MDI;
-        if (s->mdio_data & 0x8000) {
-            s->pir |= PIR_MDI;
-        }
-        s->mdio_data <<= 1;
-        if (++s->mdio_count >= 17) {
-            s->mdio_state = 0;
+    switch (s->mdio_state) {
+    case MDIO_IDLE:
+        if (!bit) {         /* ST[1] == 0 ends the preamble */
+            s->mdio_state = MDIO_CMD;
+            s->mdio_shift = 0;
             s->mdio_count = 0;
         }
+        break;
+
+    case MDIO_CMD:
+        s->mdio_shift = (s->mdio_shift << 1) | (bit ? 1 : 0);
+        if (++s->mdio_count < 13) {
+            break;
+        }
+        {
+            unsigned op = (s->mdio_shift >> 10) & 0x3;
+            unsigned reg = s->mdio_shift & 0x1f;
+
+            s->mdio_reg = reg;
+            s->mdio_count = 0;
+            if (op == 0x2) {
+                s->mdio_data = sh7764_eth_phy_read(s, reg);
+                trace_sh7764_eth_mdio(reg, s->mdio_data);
+                s->mdio_state = MDIO_READ_OUT;
+            } else if (op == 0x1) {
+                s->mdio_shift = 0;
+                s->mdio_state = MDIO_WRITE_IN;
+            } else {
+                s->mdio_state = MDIO_IDLE;
+            }
+        }
+        break;
+
+    case MDIO_READ_OUT:
+        /* One turnaround bit, then the data most significant bit first. */
+        if (s->mdio_count == 0) {
+            s->pir &= ~PIR_MDI;
+        } else {
+            s->pir = (s->pir & ~PIR_MDI) |
+                     ((s->mdio_data & 0x8000) ? PIR_MDI : 0);
+            s->mdio_data <<= 1;
+        }
+        if (++s->mdio_count > 16) {
+            s->mdio_state = MDIO_IDLE;
+        }
+        break;
+
+    case MDIO_WRITE_IN:
+        /* Two turnaround bits then sixteen of data. */
+        s->mdio_shift = (s->mdio_shift << 1) | (bit ? 1 : 0);
+        if (++s->mdio_count >= 18) {
+            sh7764_eth_phy_write(s, s->mdio_reg,
+                                 (uint16_t)(s->mdio_shift & 0xffff));
+            s->mdio_state = MDIO_IDLE;
+        }
+        break;
     }
 }
 
