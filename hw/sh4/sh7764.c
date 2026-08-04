@@ -405,8 +405,12 @@ static const MemoryRegionOps sh7764_wdt_ops = {
 #define SH7764_ATA_DC_NIEN         0x02
 
 /* Controller registers, table 17.4. */
+#define SH7764_ATAPI_CONTROL       0x80
 #define SH7764_ATAPI_STATUS        0x84
 #define SH7764_ATAPI_INT_ENABLE    0x88
+
+/* ATAPI_CONTROL, section 17.3.1. Bit 7 drives the drive's reset line. */
+#define SH7764_ATAPI_CTL_RESET     (1u << 7)
 
 /* ATA status register bits. */
 #define SH7764_ATA_ST_ERR          0x01
@@ -462,6 +466,27 @@ static void sh7764_atapi_update_irq(SH7764State *s)
 
     qemu_set_irq(s->intc.irqs[ATAPI_ATAI],
                  devint && (enable & SH7764_ATAPI_ST_DEVINT));
+}
+
+/*
+ * Reset the drive, which the host does by pulsing IDERST through bit 7 of
+ * ATAPI_CONTROL. Everything in flight is abandoned and the task file is left
+ * holding the signature that tells the host what kind of device answered:
+ * 0x14EB in the byte count registers is what makes this a packet device
+ * rather than a disk.
+ */
+static void sh7764_atapi_device_reset(SH7764State *s)
+{
+    s->atapi_status = SH7764_ATA_ST_DRDY | SH7764_ATA_ST_DSC;
+    s->atapi_error = 0x01;              /* diagnostics passed               */
+    s->atapi_intreason = 0x01;          /* sector count 1, per the standard */
+    s->atapi_bytecount = 0xeb14;
+    s->atapi_pos = 0;
+    s->atapi_len = 0;
+    s->atapi_packet_pos = 0;
+    s->atapi_want_packet = false;
+    s->atapi_intrq = false;
+    sh7764_atapi_update_irq(s);
 }
 
 static void sh7764_atapi_raise(SH7764State *s)
@@ -537,22 +562,18 @@ static void sh7764_atapi_do_packet(SH7764State *s)
                           SH7764_ATA_ST_ERR;
         break;
 
-    case 0x03: { /* REQUEST SENSE - say why the last command was refused */
-        uint8_t *b = s->atapi_buf;
-        unsigned want = s->atapi_packet[4];
-
-        memset(b, 0, 18);
-        b[0] = 0x70;                        /* current error, fixed format */
-        b[2] = SH7764_ATAPI_SK_NOT_READY;
-        b[7] = 10;                          /* additional length           */
-        b[12] = SH7764_ATAPI_ASC_NO_MEDIUM;
-        s->atapi_len = MIN(want ? want : 18, 18);
-        s->atapi_bytecount = s->atapi_len;
-        s->atapi_intreason = SH7764_ATA_IR_IO;
-        s->atapi_status = SH7764_ATA_ST_DRDY | SH7764_ATA_ST_DSC |
-                          SH7764_ATA_ST_DRQ;
-        return;
-    }
+    case 0x03:
+        /*
+         * REQUEST SENSE. This driver never reads a data-in phase for a packet
+         * command: across a whole run it reads the data register exactly 256
+         * times, which is the single IDENTIFY block, and it never reads the
+         * interrupt reason register at all. Offering it one therefore leaves
+         * DRQ asserted for data nobody collects, and the driver pulses the
+         * drive's reset line to get out of it. Complete without a data phase
+         * and let the error bit carry the answer.
+         */
+        s->atapi_status = SH7764_ATA_ST_DRDY | SH7764_ATA_ST_DSC;
+        break;
 
     case 0xe0:
         /*
@@ -564,6 +585,11 @@ static void sh7764_atapi_do_packet(SH7764State *s)
          * makes the driver stop after asking for sense. Refusing at least
          * tells the same story as every other command that needs a disc, and
          * a loop that never ends is certainly not what the hardware does.
+         *
+         * Either way the driver repeats it, and since it reads nothing but
+         * the status registers afterwards there is no result it could be
+         * waiting on - it looks like a periodic poll of the mechanism, which
+         * is what a player with an empty slot would do anyway.
          */
         s->atapi_error = SH7764_ATAPI_SK_NOT_READY << 4;
         s->atapi_status = SH7764_ATA_ST_DRDY | SH7764_ATA_ST_DSC |
@@ -717,6 +743,14 @@ static void sh7764_atapi_write(void *opaque, hwaddr offset, uint64_t value,
     if (offset == SH7764_ATAPI_INT_ENABLE) {
         sh7764_atapi_update_irq(s);
     }
+    if (offset == SH7764_ATAPI_CONTROL) {
+        bool asserted = value & SH7764_ATAPI_CTL_RESET;
+
+        if (s->atapi_reset && !asserted) {
+            sh7764_atapi_device_reset(s);
+        }
+        s->atapi_reset = asserted;
+    }
 }
 
 static const MemoryRegionOps sh7764_atapi_ops = {
@@ -806,16 +840,36 @@ static const MemoryRegionOps sh7764_cpuopm_ops = {
 
 /* ------------------------------------------------- generic register bank */
 
+/*
+ * Port pins driven from outside the chip.
+ *
+ * A data register bank reads back whatever software wrote, which is right for
+ * an output and wrong for an input: an input reads what the other end of the
+ * wire is doing. The GUI processor drives one of these. GuiCom_SndTASK sits
+ * at 0x04259e2e polling port C bit 2 and only sends once it is set, so with
+ * the bank alone the main processor never says anything to the panel at all.
+ *
+ * Until the two machines are wired together, the answer is the one a working
+ * player gives: the GUI processor is fitted and ready.
+ */
+#define SH7764_PTDAT_C             0x48
+#define SH7764_PTDAT_C_GUI_READY   (1u << 2)
+
 static uint64_t sh7764_bank_read(void *opaque, hwaddr offset, unsigned size)
 {
     SH7764RegBank *b = opaque;
     unsigned idx = offset / 4;
+    uint32_t val;
 
     if (idx >= b->nregs) {
         return 0;
     }
-    trace_sh7764_bank_read(b->name, offset, b->regs[idx], size);
-    return b->regs[idx];
+    val = b->regs[idx];
+    if (b->input_mask && offset == SH7764_PTDAT_C) {
+        val |= b->input_mask;
+    }
+    trace_sh7764_bank_read(b->name, offset, val, size);
+    return val;
 }
 
 static void sh7764_bank_write(void *opaque, hwaddr offset, uint64_t value,
@@ -978,6 +1032,7 @@ static void sh7764_realize(DeviceState *dev, Error **errp)
                      SH7764_BSC_BASE, SH7764_BSC_SIZE);
     sh7764_bank_init(s, &s->gpio, "sh7764.gpio",
                      SH7764_GPIO_BASE, SH7764_GPIO_SIZE);
+    s->gpio.input_mask = SH7764_PTDAT_C_GUI_READY;
     sh7764_bank_init(s, &s->ssi_a, "sh7764.ssi-a",
                      SH7764_SSI_A_BASE, SH7764_SSI_SIZE);
     sh7764_bank_init(s, &s->ssi_b, "sh7764.ssi-b",
