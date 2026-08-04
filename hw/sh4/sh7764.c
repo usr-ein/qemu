@@ -55,11 +55,12 @@ enum {
     WDT_ITI,
     ATAPI_ATAI,
     SSI_ADMA0, SSI_BDMA1,
+    SSI_ACH0, SSI_BCH3,
     ETHERC,
     USBI,
     DMINT1,
     /* groups */
-    SCIF0, SCIF2,
+    SCIF0, SCIF2, SSI_B,
     NR_INTC_SOURCES,
 };
 
@@ -1135,6 +1136,53 @@ static const MemoryRegionOps sh7764_watch_ops = {
 #define SH7764_SSI_DMINT_BLKNEND0   (1u << 3)
 #define SH7764_SSI_DMINT_BLKEND0    (1u << 4)
 #define SH7764_SSI_DMINT_CH0        0x1f
+
+/*
+ * The audio channel itself, one register pair per channel: SSICR at 0x2000
+ * and SSISR at 0x2004 within each module (sections 18.3.16 and 18.3.17).
+ * These sit above the DMA controller's registers and are a separate interrupt
+ * from it - SSICH0 at vector H'A20 and SSICH3 at H'AC0, against SSIDMA0 at
+ * H'A00 and SSIDMA1 at H'AA0 - and the firmware installs a handler for each
+ * of the four.
+ *
+ * The enable bits in SSICR line up with the status bits in SSISR at the same
+ * positions, so an interrupt is pending exactly while the two agree.
+ *
+ * IIRQ, the idle flag, is the one that matters here. It comes out of reset
+ * set, is read only - "writing 0 in this bit will not clear the interrupt" -
+ * and simply reports that the channel has nothing in flight. Transfers in
+ * this model complete within the store that starts them, so there is no
+ * observable moment when the channel is busy and the flag stays set.
+ *
+ * That is the whole of what the GUI link needs, and what it was missing. The
+ * firmware sets SendFlg when it arms a transmit, and only the idle interrupt
+ * clears it again: the DMA-end interrupt enables IIEN, the channel interrupt
+ * then fires and clears the flag. GuiCom_RcvTASK refuses to look at anything
+ * that arrived while SendFlg stands, printing
+ *
+ *     GU受:受信動作条件フラグが不一致(SendFlg !=0)!!!
+ *
+ * and returning without calling the message processor. With no channel
+ * interrupt the flag was set once and never cleared, so every reply the GUI
+ * processor sent was discarded - which is what the panel reports as E-8709
+ * COMMUNICATION ERROR. The receive direction is the same shape: its idle
+ * interrupt is what re-arms the receive DMA for the next message.
+ */
+#define SH7764_SSI_CR        0x2000
+#define SH7764_SSI_SR        0x2004
+
+#define SH7764_SSI_SR_RESET  0x0210a003u   /* IIRQ set, reserved bits fixed */
+#define SH7764_SSI_SR_W0C    0x0c000000u   /* UIRQ and OIRQ, write 0 to clear */
+#define SH7764_SSI_IRQ_MASK  0x0f000000u   /* UIRQ, OIRQ, IIRQ, DIRQ        */
+
+/*
+ * Reset values from table 18.2. DMINTMR comes up with every source masked,
+ * which matters because the firmware deliberately leaves RXFIFOEMP and
+ * TXFIFOFUL masked and reads them out of the status register by hand.
+ */
+#define SH7764_SSI_DMINTSR_RESET 0x01010101u
+#define SH7764_SSI_DMINTMR_RESET 0x1f1f1f1fu
+
 /*
  * The transfer count registers are named for words and measured in bytes -
  * sections 18.3.3 and 18.3.5 say so outright, and their low three bits are
@@ -1185,6 +1233,32 @@ static void sh7764_ssi_update_irq(SH7764State *s, SH7764RegBank *b)
     qemu_set_irq(s->intc.irqs[src], sh7764_ssi_pending(b));
 }
 
+/* The channel's own interrupt: a status flag whose enable bit is also set. */
+static bool sh7764_ssi_chan_pending(SH7764RegBank *b)
+{
+    uint32_t sr = sh7764_ssi_reg(b, SH7764_SSI_SR);
+    uint32_t cr = sh7764_ssi_reg(b, SH7764_SSI_CR);
+
+    return (sr & cr & SH7764_SSI_IRQ_MASK) != 0;
+}
+
+static void sh7764_ssi_chan_update_irq(SH7764State *s, SH7764RegBank *b)
+{
+    int src = (b == &s->ssi_a) ? SSI_ACH0 : SSI_BCH3;
+
+    qemu_set_irq(s->intc.irqs[src], sh7764_ssi_chan_pending(b));
+}
+
+/* Reset state for one SSI module, shared by realize and device reset. */
+static void sh7764_ssi_bank_reset(SH7764RegBank *b)
+{
+    sh7764_ssi_set(b, SH7764_SSI_DMINTSR, SH7764_SSI_DMINTSR_RESET);
+    sh7764_ssi_set(b, SH7764_SSI_DMINTMR, SH7764_SSI_DMINTMR_RESET);
+    sh7764_ssi_set(b, SH7764_SSI_SR, SH7764_SSI_SR_RESET);
+    sh7764_ssi_set(b, SH7764_SSI_CR, 0);
+    b->blocks_left = 0;
+}
+
 /*
  * INT2B4, the individual module interrupt register. Several peripherals share
  * one priority level, and this names which of them is actually asserting.
@@ -1197,11 +1271,14 @@ static void sh7764_ssi_update_irq(SH7764State *s, SH7764RegBank *b)
  * while the receive channel it was supposed to re-arm stayed idle and the
  * conversation with the panel stopped after a single exchange.
  *
- * Only the two DMA bits are filled in; the per-channel audio bits belong to
- * SSI functions this player does not use.
+ * Four of the nine bits are filled in, one per handler the firmware installs:
+ * the two DMA controllers and the two audio channels they feed. Bits 2, 3, 7
+ * and 8 belong to SSI channels this board does not wire up.
  */
 #define SH7764_INT2B4_SSIDMA0   (1u << 0)
+#define SH7764_INT2B4_SSICH0    (1u << 1)
 #define SH7764_INT2B4_SSIDMA1   (1u << 5)
+#define SH7764_INT2B4_SSICH3    (1u << 6)
 
 static uint64_t sh7764_int2b4_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -1213,6 +1290,12 @@ static uint64_t sh7764_int2b4_read(void *opaque, hwaddr offset, unsigned size)
     }
     if (sh7764_ssi_pending(&s->ssi_b)) {
         val |= SH7764_INT2B4_SSIDMA1;
+    }
+    if (sh7764_ssi_chan_pending(&s->ssi_a)) {
+        val |= SH7764_INT2B4_SSICH0;
+    }
+    if (sh7764_ssi_chan_pending(&s->ssi_b)) {
+        val |= SH7764_INT2B4_SSICH3;
     }
     return val;
 }
@@ -1357,6 +1440,32 @@ static void sh7764_ssi_tx(SH7764State *s, SH7764RegBank *b)
  * it. Anything beyond one transfer's worth stays queued: the far end sends
  * whole messages and this end asks for them one at a time.
  */
+/*
+ * RXFIFOEMP0 is a level, not an event. Section 18.3.14 gives it an initial
+ * value of one and says the hardware clears it by itself the moment the
+ * buffer stops being empty, so it reports what is there rather than latching
+ * what happened.
+ *
+ * The firmware reads it in the DMA-end handler, off the same snapshot it took
+ * of the status register, to decide whether the message it has just been
+ * given was the last one waiting. If it was, it stops the receive DMA, arms
+ * the channel's idle interrupt and lets that re-arm the transfer; the loop
+ * only continues because of this bit. Its interrupt is left masked - only the
+ * value is wanted.
+ */
+static void sh7764_ssi_rx_level(SH7764State *s)
+{
+    SH7764RegBank *b = &s->ssi_a;
+    uint32_t sts = sh7764_ssi_reg(b, SH7764_SSI_DMINTSR);
+
+    if (s->ssi_rx_len) {
+        sts &= ~SH7764_SSI_DMINT_RXFIFOEMP0;
+    } else {
+        sts |= SH7764_SSI_DMINT_RXFIFOEMP0;
+    }
+    sh7764_ssi_set(b, SH7764_SSI_DMINTSR, sts);
+}
+
 static void sh7764_ssi_rx_deliver(SH7764State *s)
 {
     SH7764RegBank *b = &s->ssi_a;
@@ -1377,6 +1486,8 @@ static void sh7764_ssi_rx_deliver(SH7764State *s)
     s->ssi_rx_armed = false;
     qemu_log_mask(LOG_UNIMP, "sh7764-ssi: delivered %u bytes to 0x%08x\n",
                   len, addr);
+    /* Before the interrupt: the handler reads both in the same breath. */
+    sh7764_ssi_rx_level(s);
     sh7764_ssi_done(s, b);
 }
 
@@ -1397,6 +1508,7 @@ static void sh7764_ssi_receive(void *opaque, const uint8_t *buf, int size)
     }
     memcpy(s->ssi_rx_buf + s->ssi_rx_len, buf, size);
     s->ssi_rx_len += size;
+    sh7764_ssi_rx_level(s);
     sh7764_ssi_rx_deliver(s);
 }
 
@@ -1630,8 +1742,27 @@ static void sh7764_bank_write(void *opaque, hwaddr offset, uint64_t value,
         case SH7764_SSI_DMINTSR:
             /* Writing one clears a source; writing zero is ignored. */
             b->regs[idx] &= ~(uint32_t)value;
+            if (b == &b->soc->ssi_a) {
+                sh7764_ssi_rx_level(b->soc);
+            }
             sh7764_ssi_update_irq(b->soc, b);
             sh7764_ssi_acked(b->soc, b);
+            return;
+        case SH7764_SSI_CR:
+            b->regs[idx] = value;
+            sh7764_ssi_chan_update_irq(b->soc, b);
+            return;
+        case SH7764_SSI_SR:
+            /*
+             * UIRQ and OIRQ clear on a written zero. IIRQ and DIRQ are read
+             * only, and the reserved bits read back fixed, so both survive
+             * whatever is written - the firmware clears the whole register in
+             * one store and depends on the idle flag still standing when it
+             * looks again.
+             */
+            b->regs[idx] = (b->regs[idx] & ~SH7764_SSI_SR_W0C) |
+                           (b->regs[idx] & (uint32_t)value & SH7764_SSI_SR_W0C);
+            sh7764_ssi_chan_update_irq(b->soc, b);
             return;
         case SH7764_SSI_DMINTMR:
             b->regs[idx] = value;
@@ -1704,6 +1835,7 @@ static struct intc_vect sh7764_vectors[] = {
     INTC_VECT(WDT_ITI, 0x560),
     INTC_VECT(ATAPI_ATAI, 0xc00),
     INTC_VECT(SSI_ADMA0, 0xa00), INTC_VECT(SSI_BDMA1, 0xaa0),
+    INTC_VECT(SSI_ACH0, 0xa20), INTC_VECT(SSI_BCH3, 0xac0),
     INTC_VECT(ETHERC, 0x920),
     INTC_VECT(USBI, 0xc60),
     INTC_VECT(DMINT1, 0x660),
@@ -1716,6 +1848,14 @@ static struct intc_vect sh7764_vectors[] = {
 static struct intc_group sh7764_groups[] = {
     INTC_GROUP(SCIF0, SCIF0_ERI, SCIF0_RXI, SCIF0_BRI, SCIF0_TXI),
     INTC_GROUP(SCIF2, SCIF2_ERI, SCIF2_RXI, SCIF2_BRI, SCIF2_TXI),
+    /*
+     * Table 13.1 gives SSIDMA1 and SSICH3 separate vectors but a single
+     * priority field, INT2PRI5[4:0], and a single mask bit, INT2MSKR[19].
+     * A group is how sh_intc expresses one gate feeding several sources.
+     * SSI_A is not like this: SSIDMA0 and SSICH0 have a field and a mask bit
+     * each, so they stay independent.
+     */
+    INTC_GROUP(SSI_B, SSI_BDMA1, SSI_BCH3),
 };
 
 /*
@@ -1731,9 +1871,9 @@ static struct intc_prio_reg sh7764_prio_registers[] = {
     { 0xffd4000c, 0, 32, 8, /* INT2PRI3 */
       { UNUSED, DMINT1, UNUSED, UNUSED } },
     { 0xffd40010, 0, 32, 8, /* INT2PRI4 */
-      { UNUSED, UNUSED, SSI_ADMA0, UNUSED } },
+      { UNUSED, UNUSED, SSI_ADMA0, SSI_ACH0 } },
     { 0xffd40014, 0, 32, 8, /* INT2PRI5 */
-      { UNUSED, UNUSED, UNUSED, SSI_BDMA1 } },
+      { UNUSED, UNUSED, UNUSED, SSI_B } },
     { 0xffd40018, 0, 32, 8, /* INT2PRI6 */
       { ATAPI_ATAI, UNUSED, UNUSED, UNUSED } },
     { 0xffd4001c, 0, 32, 8, /* INT2PRI7 */ { SCIF2, UNUSED, UNUSED, UNUSED } },
@@ -1755,8 +1895,8 @@ static struct intc_prio_reg sh7764_prio_registers[] = {
 static struct intc_mask_reg sh7764_mask_registers[] = {
     { 0xffd4003c, 0xffd40038, 32, /* INT2MSKCR / INT2MSKR */
       { 0, 0, 0, 0, 0, 0, 0, 0,                 /* 31..24 */
-        0, 0, 0, ATAPI_ATAI, SSI_BDMA1, 0, 0, 0,        /* 23..16 */
-        0, SSI_ADMA0, 0, 0, 0, 0, 0, DMINT1,    /* 15..8  */
+        0, 0, 0, ATAPI_ATAI, SSI_B, 0, 0, 0,            /* 23..16 */
+        SSI_ACH0, SSI_ADMA0, 0, 0, 0, 0, 0, DMINT1,     /* 15..8  */
         0, 0, WDT_ITI, SCIF0, 0, 0, TUNI1, TUNI0 },     /* 7..0 */
       0, true },
     { 0xffd400d4, 0xffd400d0, 32, /* INT2MSKCR1 / INT2MSKR1 */
@@ -1831,6 +1971,8 @@ static void sh7764_realize(DeviceState *dev, Error **errp)
                      SH7764_SSI_A_BASE, SH7764_SSI_SIZE);
     sh7764_bank_init(s, &s->ssi_b, "sh7764.ssi-b",
                      SH7764_SSI_B_BASE, SH7764_SSI_SIZE);
+    sh7764_ssi_bank_reset(&s->ssi_a);
+    sh7764_ssi_bank_reset(&s->ssi_b);
     memory_region_init_io(&s->atapi, OBJECT(s), &sh7764_atapi_ops, s,
                           "sh7764.atapi", SH7764_ATAPI_SIZE);
     memory_region_add_subregion(sysmem, SH7764_ATAPI_BASE, &s->atapi);
@@ -1932,6 +2074,13 @@ static void sh7764_reset(DeviceState *dev)
     s->wtcnt = 0;
     s->wtcsr = 0;
     s->wrcsr = 0;
+
+    if (s->ssi_a.regs) {
+        s->ssi_rx_len = 0;
+        s->ssi_rx_armed = false;
+        sh7764_ssi_bank_reset(&s->ssi_a);
+        sh7764_ssi_bank_reset(&s->ssi_b);
+    }
 
     /* The drive comes up idle, ready and with nothing to hand over. */
     s->atapi_status = SH7764_ATA_ST_DRDY | SH7764_ATA_ST_DSC;
