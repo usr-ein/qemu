@@ -161,6 +161,13 @@ struct SH7764State {
     uint8_t atapi_packet[12];
     uint32_t atapi_packet_pos;
     bool atapi_want_packet;
+    /*
+     * The drive's INTRQ line, and nIEN from the device control register.
+     * INTRQ is level held: the drive asserts it when a command ends or data
+     * becomes available and drops it when the host reads the status register.
+     */
+    bool atapi_intrq;
+    bool atapi_nien;
     SH7764RegBank misc_a;
 
     /* DMAC state */

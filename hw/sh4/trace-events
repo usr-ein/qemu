@@ -11,5 +11,5 @@ sh7764_bank_read(const char *n, uint64_t off, uint64_t val, unsigned sz) "%s rd 
 sh7764_bank_write(const char *n, uint64_t off, uint64_t val, unsigned sz) "%s WR +0x%03" PRIx64 " <- 0x%08" PRIx64 " (%u)"
 sh7764_dmac_read(uint64_t off, uint64_t val) "DMAC rd +0x%03" PRIx64 " -> 0x%08" PRIx64
 sh7764_dmac_write(uint64_t off, uint64_t val) "DMAC WR +0x%03" PRIx64 " <- 0x%08" PRIx64
-sh7764_atapi_read(uint64_t off, unsigned sz, uint64_t val) "ATAPI rd +0x%03" PRIx64 " (%u) -> 0x%08" PRIx64
-sh7764_atapi_write(uint64_t off, unsigned sz, uint64_t val) "ATAPI WR +0x%03" PRIx64 " (%u) <- 0x%08" PRIx64
+sh7764_atapi_read(uint64_t off, unsigned sz, uint64_t val, uint64_t pc) "ATAPI rd +0x%03" PRIx64 " (%u) -> 0x%08" PRIx64 " pc 0x%08" PRIx64
+sh7764_atapi_write(uint64_t off, unsigned sz, uint64_t val, uint64_t pc) "ATAPI WR +0x%03" PRIx64 " (%u) <- 0x%08" PRIx64 " pc 0x%08" PRIx64

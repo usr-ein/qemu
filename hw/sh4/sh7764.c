@@ -39,6 +39,25 @@
 #include "trace.h"
 
 /*
+ * Interrupt sources, named for sh_intc. Declared up here because peripherals
+ * further down raise them by index.
+ */
+enum {
+    UNUSED = 0,
+    /* TMU */
+    TUNI0, TUNI1, TUNI2, TICPI2,
+    /* SCIF0 and SCIF2 */
+    SCIF0_ERI, SCIF0_RXI, SCIF0_BRI, SCIF0_TXI,
+    SCIF2_ERI, SCIF2_RXI, SCIF2_BRI, SCIF2_TXI,
+    /* misc */
+    WDT_ITI,
+    ATAPI_ATAI,
+    /* groups */
+    SCIF0, SCIF2,
+    NR_INTC_SOURCES,
+};
+
+/*
  * CHCR.TS selects the transfer unit. The boot ROM programs TS = 3 and
  * computes DMATCR as (length >> 4), which pins that encoding to 16 bytes;
  * the smaller encodings follow the usual SH-4 progression. Anything we have
@@ -382,6 +401,13 @@ static const MemoryRegionOps sh7764_wdt_ops = {
 #define SH7764_ATAPI_TF_STATUS     0x1c   /* command on write             */
 #define SH7764_ATAPI_TF_ALTSTATUS  0x38   /* device control on write      */
 
+/* Device control, written through the alternate status offset. */
+#define SH7764_ATA_DC_NIEN         0x02
+
+/* Controller registers, table 17.4. */
+#define SH7764_ATAPI_STATUS        0x84
+#define SH7764_ATAPI_INT_ENABLE    0x88
+
 /* ATA status register bits. */
 #define SH7764_ATA_ST_ERR          0x01
 #define SH7764_ATA_ST_DRQ          0x08
@@ -401,6 +427,48 @@ static const MemoryRegionOps sh7764_wdt_ops = {
 /* Sense the drive reports with no disc loaded. */
 #define SH7764_ATAPI_SK_NOT_READY  0x02
 #define SH7764_ATAPI_ASC_NO_MEDIUM 0x3a
+
+/*
+ * Which instruction touched the controller. Bring-up needs this constantly:
+ * a register trace says what the driver did and this says where to read the
+ * code that did it.
+ */
+static uint64_t sh7764_guest_pc(void)
+{
+    return current_cpu ? SUPERH_CPU(current_cpu)->env.pc : 0;
+}
+
+/* ATAPI_STATUS and ATAPI_INT_ENABLE, figures in section 17.3. */
+#define SH7764_ATAPI_ST_DEVINT     (1u << 4)
+
+/*
+ * The module reports the drive's IDEINT in ATAPI_STATUS as DEVINT and, when
+ * the matching enable bit is set, drives the ATAI interrupt from it. DEVINT
+ * is not latched - the manual is explicit that the bit follows the line - so
+ * the whole path is recomputed from the drive's INTRQ each time either end
+ * changes.
+ */
+static void sh7764_atapi_update_irq(SH7764State *s)
+{
+    unsigned idx = (SH7764_ATAPI_INT_ENABLE - SH7764_ATAPI_TASKFILE_END) / 4;
+    bool devint = s->atapi_intrq && !s->atapi_nien;
+    uint32_t enable = idx < ARRAY_SIZE(s->atapi_ctl) ? s->atapi_ctl[idx] : 0;
+
+    idx = (SH7764_ATAPI_STATUS - SH7764_ATAPI_TASKFILE_END) / 4;
+    if (idx < ARRAY_SIZE(s->atapi_ctl)) {
+        s->atapi_ctl[idx] = (s->atapi_ctl[idx] & ~SH7764_ATAPI_ST_DEVINT) |
+                            (devint ? SH7764_ATAPI_ST_DEVINT : 0);
+    }
+
+    qemu_set_irq(s->intc.irqs[ATAPI_ATAI],
+                 devint && (enable & SH7764_ATAPI_ST_DEVINT));
+}
+
+static void sh7764_atapi_raise(SH7764State *s)
+{
+    s->atapi_intrq = true;
+    sh7764_atapi_update_irq(s);
+}
 
 static void sh7764_atapi_put_string(uint8_t *dst, const char *src, size_t len)
 {
@@ -442,6 +510,7 @@ static void sh7764_atapi_identify(SH7764State *s)
     s->atapi_intreason = SH7764_ATA_IR_IO;
     s->atapi_status = SH7764_ATA_ST_DRDY | SH7764_ATA_ST_DSC |
                       SH7764_ATA_ST_DRQ;
+    sh7764_atapi_raise(s);
 }
 
 /*
@@ -487,13 +556,18 @@ static void sh7764_atapi_do_packet(SH7764State *s)
 
     case 0xe0:
         /*
-         * A Pioneer vendor command the firmware issues before anything else,
-         * as E0 08 3C 00 00 00 00 00 00 04 00 00. Its meaning is not
-         * documented anywhere available, so it is accepted with no data
-         * rather than refused: refusing it is certainly wrong, since a real
-         * mechanism answers it, and accepting lets the probe finish.
+         * A Pioneer vendor command, issued as
+         * E0 08 3C 00 00 00 00 00 00 04 00 00, with no documentation
+         * available. Neither answer is known to be right: completing it
+         * successfully makes the driver repeat it forever, which reads as a
+         * poll waiting for the mechanism to reach some state, and refusing it
+         * makes the driver stop after asking for sense. Refusing at least
+         * tells the same story as every other command that needs a disc, and
+         * a loop that never ends is certainly not what the hardware does.
          */
-        s->atapi_status = SH7764_ATA_ST_DRDY | SH7764_ATA_ST_DSC;
+        s->atapi_error = SH7764_ATAPI_SK_NOT_READY << 4;
+        s->atapi_status = SH7764_ATA_ST_DRDY | SH7764_ATA_ST_DSC |
+                          SH7764_ATA_ST_ERR;
         break;
 
     default:
@@ -505,6 +579,7 @@ static void sh7764_atapi_do_packet(SH7764State *s)
     }
 
     s->atapi_intreason = SH7764_ATA_IR_CD | SH7764_ATA_IR_IO;
+    sh7764_atapi_raise(s);
 }
 
 static uint64_t sh7764_atapi_read(void *opaque, hwaddr offset, unsigned size)
@@ -524,6 +599,7 @@ static uint64_t sh7764_atapi_read(void *opaque, hwaddr offset, unsigned size)
             if (s->atapi_pos >= s->atapi_len) {
                 s->atapi_status = SH7764_ATA_ST_DRDY | SH7764_ATA_ST_DSC;
                 s->atapi_intreason = SH7764_ATA_IR_CD | SH7764_ATA_IR_IO;
+                sh7764_atapi_raise(s);
             }
             break;
         case SH7764_ATAPI_TF_ERROR:
@@ -542,6 +618,17 @@ static uint64_t sh7764_atapi_read(void *opaque, hwaddr offset, unsigned size)
             val = s->atapi_device;
             break;
         case SH7764_ATAPI_TF_STATUS:
+            /*
+             * Reading the status register clears the pending interrupt; the
+             * alternate status at 0x38 exists precisely so that a driver can
+             * look without acknowledging.
+             */
+            val = s->atapi_status;
+            if (s->atapi_intrq) {
+                s->atapi_intrq = false;
+                sh7764_atapi_update_irq(s);
+            }
+            break;
         case SH7764_ATAPI_TF_ALTSTATUS:
             val = s->atapi_status;
             break;
@@ -554,7 +641,7 @@ static uint64_t sh7764_atapi_read(void *opaque, hwaddr offset, unsigned size)
         val = idx < ARRAY_SIZE(s->atapi_ctl) ? s->atapi_ctl[idx] : 0;
     }
 
-    trace_sh7764_atapi_read(offset, size, val);
+    trace_sh7764_atapi_read(offset, size, val, sh7764_guest_pc());
     return val;
 }
 
@@ -564,7 +651,7 @@ static void sh7764_atapi_write(void *opaque, hwaddr offset, uint64_t value,
     SH7764State *s = opaque;
     unsigned idx;
 
-    trace_sh7764_atapi_write(offset, size, value);
+    trace_sh7764_atapi_write(offset, size, value, sh7764_guest_pc());
 
     if (offset < SH7764_ATAPI_TASKFILE_END) {
         switch (offset) {
@@ -617,11 +704,18 @@ static void sh7764_atapi_write(void *opaque, hwaddr offset, uint64_t value,
             }
             return;
         }
+        if (offset == SH7764_ATAPI_TF_ALTSTATUS) {
+            s->atapi_nien = value & SH7764_ATA_DC_NIEN;
+            sh7764_atapi_update_irq(s);
+        }
         return; /* device control and the reserved holes */
     }
     idx = (offset - SH7764_ATAPI_TASKFILE_END) / 4;
     if (idx < ARRAY_SIZE(s->atapi_ctl)) {
         s->atapi_ctl[idx] = value;
+    }
+    if (offset == SH7764_ATAPI_INT_ENABLE) {
+        sh7764_atapi_update_irq(s);
     }
 }
 
@@ -788,24 +882,12 @@ static void sh7764_scif_init(SH7764State *s, hwaddr base, int chan_index,
  * Only the sources this machine can currently drive are modelled. Adding more
  * is a matter of extending these tables; the register layout is already right.
  */
-enum {
-    UNUSED = 0,
-    /* TMU */
-    TUNI0, TUNI1, TUNI2, TICPI2,
-    /* SCIF0 and SCIF2 */
-    SCIF0_ERI, SCIF0_RXI, SCIF0_BRI, SCIF0_TXI,
-    SCIF2_ERI, SCIF2_RXI, SCIF2_BRI, SCIF2_TXI,
-    /* misc */
-    WDT_ITI,
-    /* groups */
-    SCIF0, SCIF2,
-    NR_INTC_SOURCES,
-};
 
 static struct intc_vect sh7764_vectors[] = {
     INTC_VECT(TUNI0, 0x580), INTC_VECT(TUNI1, 0x5a0),
     INTC_VECT(TUNI2, 0x5c0), INTC_VECT(TICPI2, 0x5e0),
     INTC_VECT(WDT_ITI, 0x560),
+    INTC_VECT(ATAPI_ATAI, 0xc00),
     INTC_VECT(SCIF0_ERI, 0x700), INTC_VECT(SCIF0_RXI, 0x720),
     INTC_VECT(SCIF0_BRI, 0x740), INTC_VECT(SCIF0_TXI, 0x760),
     INTC_VECT(SCIF2_ERI, 0xf00), INTC_VECT(SCIF2_RXI, 0xf20),
@@ -827,6 +909,8 @@ static struct intc_group sh7764_groups[] = {
 static struct intc_prio_reg sh7764_prio_registers[] = {
     { 0xffd40000, 0, 32, 8, /* INT2PRI0 */ { TUNI0, TUNI1, TUNI2, TICPI2 } },
     { 0xffd40008, 0, 32, 8, /* INT2PRI2 */ { SCIF0, UNUSED, WDT_ITI, UNUSED } },
+    { 0xffd40018, 0, 32, 8, /* INT2PRI6 */
+      { ATAPI_ATAI, UNUSED, UNUSED, UNUSED } },
     { 0xffd4001c, 0, 32, 8, /* INT2PRI7 */ { SCIF2, UNUSED, UNUSED, UNUSED } },
 };
 
@@ -845,7 +929,7 @@ static struct intc_mask_reg sh7764_mask_registers[] = {
     { 0xffd4003c, 0xffd40038, 32, /* INT2MSKCR / INT2MSKR */
       { 0, 0, 0, 0, 0, 0, 0, 0,                 /* 31..24 */
         0, 0, 0, 0, 0, 0, 0, 0,                 /* 23..16 */
-        0, 0, 0, 0, 0, 0, 0, 0,                 /* 15..8  */
+        0, ATAPI_ATAI, 0, 0, 0, 0, 0, 0,        /* 15..8  */
         0, 0, WDT_ITI, SCIF0, 0, 0, TUNI1, TUNI0 },     /* 7..0 */
       0, true },
     { 0xffd400d4, 0xffd400d0, 32, /* INT2MSKCR1 / INT2MSKR1 */
