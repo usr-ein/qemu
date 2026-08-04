@@ -368,3 +368,14 @@ canokey_handle_data_out(uint8_t ep_out, uint32_t out_len) "ep %d len %d"
 canokey_handle_data_in(uint8_t ep_in, uint32_t in_len) "ep %d len %d"
 canokey_realize(void)
 canokey_unrealize(void)
+
+# hcd-sh7764-usb.c
+usb_sh7764_attach(int speed) "speed %d"
+usb_sh7764_detach(void) ""
+usb_sh7764_reset(int rhst) "reset done, rhst %d"
+usb_sh7764_setup(uint8_t rt, uint8_t req, uint16_t val, uint16_t idx, uint16_t len) "bmRequestType 0x%02x bRequest 0x%02x wValue 0x%04x wIndex 0x%04x wLength %d"
+usb_sh7764_pipe_start(unsigned pipe, int in, unsigned addr, unsigned ep, unsigned len) "pipe %u in %d dev %u ep %u len %u"
+usb_sh7764_pipe_done(unsigned pipe, int status, unsigned actual) "pipe %u status %d actual %u"
+usb_sh7764_fifo(unsigned fifo, unsigned pipe, const char *op, unsigned size) "fifo %u pipe %u %s size %u"
+usb_sh7764_reg_read(uint32_t addr, uint32_t val) "0x%03x -> 0x%04x"
+usb_sh7764_reg_write(uint32_t addr, uint32_t val) "0x%03x <- 0x%04x"

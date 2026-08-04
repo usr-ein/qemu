@@ -26,6 +26,7 @@ config SH7764
     select UNIMP
     select SH_SCI
     select SH_TIMER
+    select USB_SH7764
 
 config CDJ2KNXS
     bool

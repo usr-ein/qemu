@@ -66,6 +66,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(SH7764State, SH7764)
  */
 #define SH7764_MISC_A_BASE      0xffa00000
 #define SH7764_MISC_A_SIZE      0x00001000
+/* USB 2.0 host/function module, section 21. */
+#define SH7764_USB_BASE         0xfe400000
+
 /*
  * CPU operation mode register, appendix A of the hardware manual. INTMU
  * (bit 3) makes an accepted interrupt load its priority into SR.IMASK.
@@ -169,6 +172,7 @@ struct SH7764State {
     MemoryRegion int2b4;
     MemoryRegion int2b4_p4;
     DeviceState *eth;
+    DeviceState *usb;
     MemoryRegion atapi;
     uint32_t atapi_ctl[0x40];
     /*
