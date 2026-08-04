@@ -537,7 +537,6 @@ static void bf531_realize(DeviceState *dev, Error **errp)
             { BF531_UART_BASE,   "bf531.uart" },
             { BF531_TIMER_BASE,  "bf531.timer" },
             { BF531_SPORT0_BASE, "bf531.sport0" },
-            { BF531_SPORT1_BASE, "bf531.sport1" },
             { BF531_EBIU_BASE,   "bf531.ebiu" },
             { BF531_DMA_TC_BASE, "bf531.dma-tc" },
         };
@@ -587,6 +586,20 @@ static void bf531_realize(DeviceState *dev, Error **errp)
                            s->sic_in[BF531_SIC_ID_DMA0 + i]);
     }
 
+    /*
+     * SPORT1 is the link to the main processor. Its two DMA channels are 3
+     * for receive and 4 for transmit, which is what the GUI firmware
+     * programs and what SIC bits 11 and 12 report.
+     */
+    object_property_set_link(OBJECT(&s->sport1), "dma", OBJECT(&s->dma),
+                             &error_abort);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->sport1), errp)) {
+        return;
+    }
+    memory_region_add_subregion(sysmem, BF531_SPORT1_BASE,
+                                sysbus_mmio_get_region(
+                                    SYS_BUS_DEVICE(&s->sport1), 0));
+
     object_property_set_link(OBJECT(&s->ppi), "dma", OBJECT(&s->dma),
                              &error_abort);
     object_property_set_uint(OBJECT(&s->ppi), "panel-lines", s->panel_lines,
@@ -624,6 +637,7 @@ static void bf531_init(Object *obj)
     object_initialize_child(obj, "cpu", &s->cpu, TYPE_BF531_CPU);
     object_initialize_child(obj, "dma", &s->dma, TYPE_BFIN_DMA);
     object_initialize_child(obj, "ppi", &s->ppi, TYPE_BFIN_PPI);
+    object_initialize_child(obj, "sport1", &s->sport1, TYPE_BFIN_SPORT);
 }
 
 static const Property bf531_properties[] = {

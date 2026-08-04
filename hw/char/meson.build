@@ -24,6 +24,7 @@ system_ss.add(when: 'CONFIG_XILINX', if_true: files('xilinx_uartlite.c'))
 system_ss.add(when: 'CONFIG_DIVA_GSP', if_true: files('diva-gsp.c'))
 
 system_ss.add(when: 'CONFIG_AVR_USART', if_true: files('avr_usart.c'))
+system_ss.add(when: 'CONFIG_BFIN_SPORT', if_true: files('bfin_sport.c'))
 system_ss.add(when: 'CONFIG_COLDFIRE', if_true: files('mcf_uart.c'))
 system_ss.add(when: 'CONFIG_DIGIC', if_true: files('digic-uart.c'))
 system_ss.add(when: 'CONFIG_EXYNOS4', if_true: files('exynos4210_uart.c'))

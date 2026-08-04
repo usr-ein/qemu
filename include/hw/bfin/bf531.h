@@ -15,6 +15,7 @@
 #include "target/bfin/cpu.h"
 #include "hw/dma/bfin_dma.h"
 #include "hw/display/bfin_ppi.h"
+#include "hw/char/bfin_sport.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
 
@@ -114,6 +115,7 @@ struct BF531State {
     ArchCPU cpu;
     BfinDMAState dma;
     BfinPPIState ppi;
+    BfinSPORTState sport1;
 
     MemoryRegion *sysmem;
     MemoryRegion sdram;

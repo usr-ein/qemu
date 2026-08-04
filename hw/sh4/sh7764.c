@@ -838,6 +838,45 @@ static const MemoryRegionOps sh7764_cpuopm_ops = {
     .valid.max_access_size = 4,
 };
 
+/* ------------------------------------------------------------ write watch */
+
+/*
+ * A write watch over ordinary memory, enabled with
+ *
+ *   -global sh7764.watch-base=ADDR -global sh7764.watch-size=N
+ *
+ * Firmware archaeology keeps reducing to "which instruction wrote this word",
+ * and there is no way to ask that of a plain RAM region. This shadows the
+ * range at higher priority, logs each write with the instruction that made
+ * it, and writes through, so the guest sees no difference.
+ */
+static uint64_t sh7764_watch_read(void *opaque, hwaddr offset, unsigned size)
+{
+    SH7764State *s = opaque;
+
+    return ldn_le_p((uint8_t *)s->watch_ram + offset, size);
+}
+
+static void sh7764_watch_write(void *opaque, hwaddr offset, uint64_t value,
+                               unsigned size)
+{
+    SH7764State *s = opaque;
+
+    qemu_log_mask(LOG_UNIMP,
+                  "WATCH %08" PRIx64 " <- %0*" PRIx64 " size %u pc %08" PRIx64
+                  "\n", (uint64_t)(s->watch_base + offset), size * 2, value,
+                  size, sh7764_guest_pc());
+    stn_le_p((uint8_t *)s->watch_ram + offset, size, value);
+}
+
+static const MemoryRegionOps sh7764_watch_ops = {
+    .read = sh7764_watch_read,
+    .write = sh7764_watch_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
 /* ------------------------------------------------- generic register bank */
 
 /*
@@ -1033,6 +1072,21 @@ static void sh7764_realize(DeviceState *dev, Error **errp)
     sh7764_bank_init(s, &s->gpio, "sh7764.gpio",
                      SH7764_GPIO_BASE, SH7764_GPIO_SIZE);
     s->gpio.input_mask = SH7764_PTDAT_C_GUI_READY;
+
+    if (s->watch_size) {
+        MemoryRegionSection sec;
+
+        sec = memory_region_find(get_system_memory(), s->watch_base, 1);
+        if (sec.mr && memory_region_is_ram(sec.mr)) {
+            s->watch_ram = memory_region_get_ram_ptr(sec.mr) +
+                           sec.offset_within_region;
+            memory_region_init_io(&s->watch, OBJECT(s), &sh7764_watch_ops, s,
+                                  "sh7764.watch", s->watch_size);
+            memory_region_add_subregion_overlap(get_system_memory(),
+                                                s->watch_base, &s->watch, 1);
+        }
+        memory_region_unref(sec.mr);
+    }
     sh7764_bank_init(s, &s->ssi_a, "sh7764.ssi-a",
                      SH7764_SSI_A_BASE, SH7764_SSI_SIZE);
     sh7764_bank_init(s, &s->ssi_b, "sh7764.ssi-b",
@@ -1122,6 +1176,8 @@ static const Property sh7764_properties[] = {
      * rather than a hardcoded guess.
      */
     DEFINE_PROP_UINT32("periph-clock-hz", SH7764State, periph_freq, 50000000),
+    DEFINE_PROP_UINT32("watch-base", SH7764State, watch_base, 0),
+    DEFINE_PROP_UINT32("watch-size", SH7764State, watch_size, 0),
 };
 
 static void sh7764_class_init(ObjectClass *klass, const void *data)

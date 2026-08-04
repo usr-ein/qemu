@@ -173,6 +173,12 @@ struct SH7764State {
     bool atapi_reset;
     SH7764RegBank misc_a;
 
+    /* Optional write watch; see sh7764_watch_write. */
+    MemoryRegion watch;
+    void *watch_ram;
+    uint32_t watch_base;
+    uint32_t watch_size;
+
     /* DMAC state */
     uint32_t dmaor;
     uint32_t sar[SH7764_DMAC_NCHAN];

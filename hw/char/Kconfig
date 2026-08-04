@@ -95,3 +95,7 @@ config IP_OCTAL_232
     bool
     default y
     depends on IPACK
+
+config BFIN_SPORT
+    bool
+    select BFIN_DMA
