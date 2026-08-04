@@ -1119,6 +1119,8 @@ static const MemoryRegionOps sh7764_watch_ops = {
 #define SH7764_SSI_WDMADR    0x1018   /* receive destination in memory      */
 #define SH7764_SSI_WDMCNTR   0x1020   /* receive length, in words           */
 #define SH7764_SSI_DMCOR     0x1028   /* bit 0 starts the transfer          */
+#define SH7764_SSI_BLCNTSR   0x1040   /* block size, in bytes               */
+#define SH7764_SSI_BLNCNTSR  0x1050   /* how many blocks                    */
 
 #define SH7764_SSI_DMINTSR   0x1188   /* interrupt status                   */
 #define SH7764_SSI_DMINTMR   0x1190   /* interrupt mask, 1 = masked         */
@@ -1271,23 +1273,61 @@ static void sh7764_ssi_done(SH7764State *s, SH7764RegBank *b)
 {
     uint32_t dmcor = sh7764_ssi_reg(b, SH7764_SSI_DMCOR);
 
+    uint32_t blksz = sh7764_ssi_reg(b, SH7764_SSI_BLCNTSR);
+    uint32_t nblk = sh7764_ssi_reg(b, SH7764_SSI_BLNCNTSR);
+
     if (!(dmcor & SH7764_SSI_DMCOR_RPTMD)) {
         sh7764_ssi_set(b, SH7764_SSI_DMCOR, dmcor & ~SH7764_SSI_DMCOR_EN);
     }
+
     /*
-     * All three completions land together. The word count is programmed as
-     * exactly the block size times the block count - sixteen bytes a block,
-     * three blocks for the forty-eight byte answers the panel sends - so a
-     * transfer that satisfies the word count has also finished its last block
-     * and its last group of blocks. The driver's service routine tests the
-     * three separately and does different work for each, and the one that
-     * hands the buffer on is not the one that DMEND alone reaches.
+     * The three completions do not all mean the same thing and the driver
+     * counts on that. BLKEND is raised once per block - the byte count in
+     * SSIBLCNTSR - BLKNEND once the block count in SSIBLNCNTSR is exhausted,
+     * and DMEND once the whole word count is done. The service routine at
+     * 0x04310d20 counts BLKENDs and, when DMEND arrives, checks the count
+     * against the block count before deciding the transfer was clean; raising
+     * all three together leaves that count at one, and the routine takes its
+     * "short transfer" path every time.
+     *
+     * So hold the remaining blocks and hand them over one interrupt at a
+     * time. The routine acknowledges by writing the status bit back clear,
+     * which is where the next one is raised.
      */
+    b->blocks_left = (blksz && nblk) ? nblk : 1;
     sh7764_ssi_set(b, SH7764_SSI_DMINTSR,
                    sh7764_ssi_reg(b, SH7764_SSI_DMINTSR) |
-                   SH7764_SSI_DMINT_DMEND0 |
-                   SH7764_SSI_DMINT_BLKNEND0 |
                    SH7764_SSI_DMINT_BLKEND0);
+    if (b->blocks_left <= 1) {
+        sh7764_ssi_set(b, SH7764_SSI_DMINTSR,
+                       sh7764_ssi_reg(b, SH7764_SSI_DMINTSR) |
+                       SH7764_SSI_DMINT_DMEND0 |
+                       SH7764_SSI_DMINT_BLKNEND0);
+    }
+    sh7764_ssi_update_irq(s, b);
+}
+
+/*
+ * Called when the driver acknowledges a completion by writing the status
+ * register. If blocks are still outstanding the next BLKEND goes up, and the
+ * last one brings BLKNEND and DMEND with it.
+ */
+static void sh7764_ssi_acked(SH7764State *s, SH7764RegBank *b)
+{
+    uint32_t sts = sh7764_ssi_reg(b, SH7764_SSI_DMINTSR);
+
+    if (!b->blocks_left || (sts & SH7764_SSI_DMINT_BLKEND0)) {
+        return;
+    }
+    if (--b->blocks_left == 0) {
+        return;
+    }
+
+    sts |= SH7764_SSI_DMINT_BLKEND0;
+    if (b->blocks_left == 1) {
+        sts |= SH7764_SSI_DMINT_DMEND0 | SH7764_SSI_DMINT_BLKNEND0;
+    }
+    sh7764_ssi_set(b, SH7764_SSI_DMINTSR, sts);
     sh7764_ssi_update_irq(s, b);
 }
 
@@ -1591,6 +1631,7 @@ static void sh7764_bank_write(void *opaque, hwaddr offset, uint64_t value,
             /* Writing one clears a source; writing zero is ignored. */
             b->regs[idx] &= ~(uint32_t)value;
             sh7764_ssi_update_irq(b->soc, b);
+            sh7764_ssi_acked(b->soc, b);
             return;
         case SH7764_SSI_DMINTMR:
             b->regs[idx] = value;

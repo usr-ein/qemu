@@ -153,6 +153,8 @@ typedef struct SH7764RegBank {
     const char *name;
     uint32_t *regs;
     unsigned nregs;
+    /* Blocks an SSI transfer still owes the driver; see sh7764_ssi_done. */
+    uint32_t blocks_left;
 } SH7764RegBank;
 
 struct SH7764State {
