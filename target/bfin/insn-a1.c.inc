@@ -291,20 +291,24 @@ static bool trans_st_im_d(DisasContext *ctx, arg_st_im_d *a)
 /*
  * The manual calls the displacement uimm7m4 and writes the syntax as
  * [FP - uimm7m4], which reads as though the five-bit field were the magnitude
- * divided by four. It is not: the field is negated in five bits before being
- * scaled, so it counts *up* towards the frame pointer. Zero means FP itself
- * and one means FP-124, which is what makes the whole 0..124 range of a
- * seven-bit multiple of four reachable from five bits.
+ * divided by four. It is not. The field carries an implied sign bit: a sixth
+ * bit is set above it and the result is sign extended before being scaled, so
+ * the field counts *up* towards the frame pointer over the range FP-128 to
+ * FP-4. Zero is the furthest slot, not the nearest.
  *
  * Getting this backwards is not a small error and does not fail loudly. The
  * firmware builds a six-field thread descriptor at FP-100 with offsets 7 to
  * 12, and the mirrored addresses FP-28 to FP-48 are inside the same frame, so
  * every store succeeded - into the wrong half of the frame, in reverse field
  * order. The descriptor stayed zero and thread creation returned -17.
+ *
+ * Reading the field as a five-bit negation instead of a six-bit signed value
+ * agrees everywhere except at zero, where it gives FP itself rather than
+ * FP-128 - so [FP - 0x80] wrote over the frame pointer's own slot.
  */
 static int fp_disp(int off)
 {
-    return -(((32 - off) & 31) * 4);
+    return (off - 32) * 4;
 }
 
 static bool trans_ld_d_fp_off(DisasContext *ctx, arg_ld_d_fp_off *a)
