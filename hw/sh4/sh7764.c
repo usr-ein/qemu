@@ -82,131 +82,218 @@ static hwaddr sh7764_dma_addr(uint32_t addr)
     return addr;
 }
 
+/* Step for one unit under an SM/DM address mode; 11 is prohibited. */
+static int sh7764_dma_step(uint32_t chcr, int shift, unsigned unit)
+{
+    switch ((chcr >> shift) & SH7764_CHCR_AM_MASK) {
+    case SH7764_CHCR_AM_INC:
+        return unit;
+    case SH7764_CHCR_AM_DEC:
+        return -(int)unit;
+    default:
+        return 0;
+    }
+}
+
 static void sh7764_dma_run(SH7764State *s, int ch)
 {
     uint32_t chcr = s->chcr[ch];
-    unsigned unit, ts;
-    uint64_t len;
+    unsigned unit, ts, rs;
+    int sstep, dstep;
+    uint32_t count;
     hwaddr src, dst;
-    uint8_t buf[4096];
+    uint8_t buf[32];
 
     if (!(chcr & SH7764_CHCR_DE) || !(s->dmaor & SH7764_DMAOR_DME)) {
         return;
     }
 
     ts = (chcr >> SH7764_CHCR_TS_SHIFT) & SH7764_CHCR_TS_MASK;
+    if (chcr & SH7764_CHCR_TS2) {
+        ts |= 4;
+    }
     unit = sh7764_ts_unit[ts];
-    len = (uint64_t)s->tcr[ch] * unit;
-    if (len == 0) {
+    /* TCR counts units, and zero means the full 16,777,216. */
+    count = s->tcr[ch] ? s->tcr[ch] : 0x1000000;
+
+    sstep = sh7764_dma_step(chcr, SH7764_CHCR_SM_SHIFT, unit);
+    dstep = sh7764_dma_step(chcr, SH7764_CHCR_DM_SHIFT, unit);
+    rs = (chcr >> SH7764_CHCR_RS_SHIFT) & SH7764_CHCR_RS_MASK;
+
+    /*
+     * A channel in peripheral-request mode moves one unit per request from
+     * the module named in DMARS, so it can only run as fast as that module.
+     * Draining it here is right when the module is the destination - the
+     * transmit side of a SCIF takes everything it is given - but wrong when
+     * it is the source, because the data has not arrived yet and a fixed
+     * source address would read the same empty receive register over and
+     * over. Leave those armed and let nothing happen rather than invent
+     * bytes; the receive direction needs the module to drive the channel.
+     */
+    if (rs == SH7764_CHCR_RS_DMARS && sstep == 0) {
         return;
     }
 
     src = sh7764_dma_addr(s->sar[ch]);
     dst = sh7764_dma_addr(s->dar[ch]);
-    trace_sh7764_dma_run(ch, src, dst, len, unit);
+    trace_sh7764_dma_run(ch, src, dst, (uint64_t)count * unit, unit);
 
     /*
      * Real hardware would run this in the background and raise TE when it
      * finishes. Firmware only ever polls TE, so completing synchronously is
      * indistinguishable and avoids modelling bus arbitration.
      */
-    while (len) {
-        size_t n = MIN(len, sizeof(buf));
-
+    while (count--) {
         address_space_read(&address_space_memory, src,
-                           MEMTXATTRS_UNSPECIFIED, buf, n);
+                           MEMTXATTRS_UNSPECIFIED, buf, unit);
         address_space_write(&address_space_memory, dst,
-                            MEMTXATTRS_UNSPECIFIED, buf, n);
-        src += n;
-        dst += n;
-        len -= n;
+                            MEMTXATTRS_UNSPECIFIED, buf, unit);
+        src += sstep;
+        dst += dstep;
     }
 
     /*
-     * Deliberately leave SAR/DAR alone. Whether the engine post-increments
-     * them depends on CHCR's SM/DM address-mode bits, and we cannot verify a
-     * reading of those against real silicon. Leaving them as programmed
-     * matches the reference interpreter this model was validated against, and
-     * firmware reprograms them before every transfer anyway.
+     * SAR and DAR follow the address modes, and TCR holds what is left of the
+     * count, which is nothing once the transfer has run to the end.
      */
+    s->sar[ch] = src;
+    s->dar[ch] = dst;
     s->tcr[ch] = 0;
     s->chcr[ch] |= SH7764_CHCR_TE;
 }
 
+/* Channel for a register offset, or -1 if the offset is not a channel's. */
 static int sh7764_dma_chan(hwaddr offset)
 {
-    if (offset < SH7764_DMAC_CH0) {
-        return -1;
+    if (offset >= SH7764_DMAC_CH0 &&
+        offset < SH7764_DMAC_CH0 + SH7764_DMAC_CH_STRIDE * 4) {
+        return (offset - SH7764_DMAC_CH0) / SH7764_DMAC_CH_STRIDE;
     }
-    offset -= SH7764_DMAC_CH0;
-    if (offset >= SH7764_DMAC_CH_STRIDE * SH7764_DMAC_NCHAN) {
-        return -1;
+    if (offset >= SH7764_DMAC_CH4 &&
+        offset < SH7764_DMAC_CH4 + SH7764_DMAC_CH_STRIDE * 2) {
+        return 4 + (offset - SH7764_DMAC_CH4) / SH7764_DMAC_CH_STRIDE;
     }
-    return offset / SH7764_DMAC_CH_STRIDE;
+    return -1;
+}
+
+/* Likewise for the B-side reload registers, which channels 0 to 3 have. */
+static int sh7764_dma_chan_b(hwaddr offset)
+{
+    if (offset >= SH7764_DMAC_CHB0 &&
+        offset < SH7764_DMAC_CHB0 +
+                 SH7764_DMAC_CHB_STRIDE * SH7764_DMAC_NCHAN_B) {
+        return (offset - SH7764_DMAC_CHB0) / SH7764_DMAC_CHB_STRIDE;
+    }
+    return -1;
 }
 
 static uint64_t sh7764_dmac_read(void *opaque, hwaddr offset, unsigned size)
 {
     SH7764State *s = opaque;
-    int ch = sh7764_dma_chan(offset);
+    int ch, chb, rs;
 
     if (offset == SH7764_DMAC_DMAOR) {
         trace_sh7764_dmac_read(offset, s->dmaor);
         return s->dmaor;
     }
-    if (ch < 0) {
-        qemu_log_mask(LOG_UNIMP, "sh7764: DMAC read of unhandled offset 0x%"
-                      HWADDR_PRIx "\n", offset);
-        return 0;
+
+    rs = (offset - SH7764_DMAC_DMARS) / 4;
+    if (offset >= SH7764_DMAC_DMARS && rs < SH7764_DMAC_NDMARS) {
+        trace_sh7764_dmac_read(offset, s->dmars[rs]);
+        return s->dmars[rs];
     }
 
-    trace_sh7764_dmac_read(offset, 0);
-    switch (offset % SH7764_DMAC_CH_STRIDE) {
-    case SH7764_DMAC_SAR:
-        return s->sar[ch];
-    case SH7764_DMAC_DAR:
-        return s->dar[ch];
-    case SH7764_DMAC_TCR:
-        return s->tcr[ch];
-    case SH7764_DMAC_CHCR:
-        return s->chcr[ch];
-    default:
-        return 0;
+    ch = sh7764_dma_chan(offset);
+    if (ch >= 0) {
+        switch (offset % SH7764_DMAC_CH_STRIDE) {
+        case SH7764_DMAC_SAR:
+            return s->sar[ch];
+        case SH7764_DMAC_DAR:
+            return s->dar[ch];
+        case SH7764_DMAC_TCR:
+            return s->tcr[ch];
+        case SH7764_DMAC_CHCR:
+            return s->chcr[ch];
+        }
     }
+
+    chb = sh7764_dma_chan_b(offset);
+    if (chb >= 0) {
+        switch (offset % SH7764_DMAC_CHB_STRIDE) {
+        case SH7764_DMAC_SAR:
+            return s->sarb[chb];
+        case SH7764_DMAC_DAR:
+            return s->darb[chb];
+        case SH7764_DMAC_TCR:
+            return s->tcrb[chb];
+        }
+    }
+
+    qemu_log_mask(LOG_UNIMP, "sh7764: DMAC read of unhandled offset 0x%"
+                  HWADDR_PRIx "\n", offset);
+    return 0;
 }
 
 static void sh7764_dmac_write(void *opaque, hwaddr offset, uint64_t value,
                               unsigned size)
 {
     SH7764State *s = opaque;
-    int ch = sh7764_dma_chan(offset);
+    int ch, chb, rs;
 
     trace_sh7764_dmac_write(offset, value);
     if (offset == SH7764_DMAC_DMAOR) {
         s->dmaor = value;
         return;
     }
-    if (ch < 0) {
-        qemu_log_mask(LOG_UNIMP, "sh7764: DMAC write of unhandled offset 0x%"
-                      HWADDR_PRIx " = 0x%" PRIx64 "\n", offset, value);
+
+    rs = (offset - SH7764_DMAC_DMARS) / 4;
+    if (offset >= SH7764_DMAC_DMARS && rs < SH7764_DMAC_NDMARS) {
+        s->dmars[rs] = value;
         return;
     }
 
-    switch (offset % SH7764_DMAC_CH_STRIDE) {
-    case SH7764_DMAC_SAR:
-        s->sar[ch] = value;
-        break;
-    case SH7764_DMAC_DAR:
-        s->dar[ch] = value;
-        break;
-    case SH7764_DMAC_TCR:
-        s->tcr[ch] = value;
-        break;
-    case SH7764_DMAC_CHCR:
-        s->chcr[ch] = value;
-        sh7764_dma_run(s, ch);
-        break;
+    ch = sh7764_dma_chan(offset);
+    if (ch >= 0) {
+        switch (offset % SH7764_DMAC_CH_STRIDE) {
+        case SH7764_DMAC_SAR:
+            s->sar[ch] = value;
+            break;
+        case SH7764_DMAC_DAR:
+            s->dar[ch] = value;
+            break;
+        case SH7764_DMAC_TCR:
+            /* A write to TCR lands in TCRB too; section 12.3.6. */
+            s->tcr[ch] = value;
+            if (ch < SH7764_DMAC_NCHAN_B) {
+                s->tcrb[ch] = value;
+            }
+            break;
+        case SH7764_DMAC_CHCR:
+            s->chcr[ch] = value;
+            sh7764_dma_run(s, ch);
+            break;
+        }
+        return;
     }
+
+    chb = sh7764_dma_chan_b(offset);
+    if (chb >= 0) {
+        switch (offset % SH7764_DMAC_CHB_STRIDE) {
+        case SH7764_DMAC_SAR:
+            s->sarb[chb] = value;
+            break;
+        case SH7764_DMAC_DAR:
+            s->darb[chb] = value;
+            break;
+        case SH7764_DMAC_TCR:
+            s->tcrb[chb] = value;
+            break;
+        }
+        return;
+    }
+
+    qemu_log_mask(LOG_UNIMP, "sh7764: DMAC write of unhandled offset 0x%"
+                  HWADDR_PRIx " = 0x%" PRIx64 "\n", offset, value);
 }
 
 static const MemoryRegionOps sh7764_dmac_ops = {

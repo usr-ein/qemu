@@ -33,7 +33,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(SH7764State, SH7764)
 #define SH7764_CCN_SIZE         0x00001000
 
 #define SH7764_DMAC_BASE        0xff608000  /* direct memory access controller*/
-#define SH7764_DMAC_SIZE        0x00001000
+#define SH7764_DMAC_SIZE        0x00002000  /* reaches the DMARS at +0x9000   */
 
 #define SH7764_BSC_BASE         0xff800000  /* bus state controller / DDR     */
 #define SH7764_BSC_SIZE         0x00003000  /* covers +0x1000 and +0x2000     */
@@ -87,13 +87,21 @@ OBJECT_DECLARE_SIMPLE_TYPE(SH7764State, SH7764)
 #define SH7764_CCN_PRR          0x44
 
 /*
- * DMAC. Offsets proven from the boot ROM: it loads r1 = 0xff608060 and then
- * writes SAR/DAR/DMATCR/CHCR at +0x20/+0x24/+0x28/+0x2c.
+ * DMAC, section 12.3. Channels 0 to 3 sit in one run from 0x20, DMAOR splits
+ * them from channels 4 and 5, and the B-side reload registers follow at 0x120.
+ * The DMA extended resource selectors are a kilobyte further on, which is why
+ * the window has to reach past 0x9008.
  */
+#define SH7764_DMAC_CH0         0x0020      /* SAR0; channels 0 to 3          */
 #define SH7764_DMAC_DMAOR       0x0060      /* 16-bit, bit 0 = DME            */
-#define SH7764_DMAC_CH0         0x0080      /* channel register block         */
+#define SH7764_DMAC_CH4         0x0070      /* SAR4; channels 4 and 5         */
+#define SH7764_DMAC_CHB0        0x0120      /* SARB0; channels 0 to 3         */
 #define SH7764_DMAC_CH_STRIDE   0x0010
-#define SH7764_DMAC_NCHAN       8
+#define SH7764_DMAC_CHB_STRIDE  0x0010
+#define SH7764_DMAC_NCHAN       6
+#define SH7764_DMAC_NCHAN_B     4
+#define SH7764_DMAC_DMARS       0x9000      /* 16-bit, one per channel pair   */
+#define SH7764_DMAC_NDMARS      3
 
 #define SH7764_DMAC_SAR         0x00
 #define SH7764_DMAC_DAR         0x04
@@ -102,8 +110,20 @@ OBJECT_DECLARE_SIMPLE_TYPE(SH7764State, SH7764)
 
 #define SH7764_CHCR_DE          (1u << 0)   /* enable                         */
 #define SH7764_CHCR_TE          (1u << 1)   /* transfer end                   */
-#define SH7764_CHCR_TS_SHIFT    4
-#define SH7764_CHCR_TS_MASK     0x7
+/* Transfer size is TS[1:0] at bits 4 and 3 with TS[2] stranded at bit 20. */
+#define SH7764_CHCR_TS_SHIFT    3
+#define SH7764_CHCR_TS_MASK     0x3
+#define SH7764_CHCR_TS2         (1u << 20)
+#define SH7764_CHCR_SM_SHIFT    12          /* source address mode            */
+#define SH7764_CHCR_DM_SHIFT    14          /* destination address mode       */
+#define SH7764_CHCR_AM_MASK     0x3
+#define SH7764_CHCR_AM_FIXED    0
+#define SH7764_CHCR_AM_INC      1
+#define SH7764_CHCR_AM_DEC      2
+#define SH7764_CHCR_RS_SHIFT    8           /* resource select                */
+#define SH7764_CHCR_RS_MASK     0xf
+#define SH7764_CHCR_RS_AUTO     0x4
+#define SH7764_CHCR_RS_DMARS    0x8
 
 #define SH7764_DMAOR_DME        (1u << 0)
 
@@ -197,6 +217,10 @@ struct SH7764State {
     uint32_t dar[SH7764_DMAC_NCHAN];
     uint32_t tcr[SH7764_DMAC_NCHAN];
     uint32_t chcr[SH7764_DMAC_NCHAN];
+    uint32_t sarb[SH7764_DMAC_NCHAN_B];
+    uint32_t darb[SH7764_DMAC_NCHAN_B];
+    uint32_t tcrb[SH7764_DMAC_NCHAN_B];
+    uint16_t dmars[SH7764_DMAC_NDMARS];
 
     uint32_t ccr;
 
