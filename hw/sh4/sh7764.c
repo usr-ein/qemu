@@ -997,10 +997,6 @@ static const MemoryRegionOps sh7764_watch_ops = {
 #define SH7764_SSI_WDMCNTR   0x1020   /* receive length, in words           */
 #define SH7764_SSI_DMCOR     0x1028   /* bit 0 starts the transfer          */
 
-/* Port C bit 2 is the panel's ready line; see the note further down. */
-#define SH7764_PTDAT_C             0x48
-#define SH7764_PTDAT_C_GUI_READY   (1u << 2)
-
 #define SH7764_SSI_DMINTSR   0x1188   /* interrupt status                   */
 #define SH7764_SSI_DMINTMR   0x1190   /* interrupt mask, 1 = masked         */
 
@@ -1230,16 +1226,19 @@ static void sh7764_ssi_start(SH7764State *s, SH7764RegBank *b, uint32_t value)
 /* ------------------------------------------------- generic register bank */
 
 /*
- * Port pins driven from outside the chip.
+ * Port C bit 2 is an output, not an input.
  *
- * A data register bank reads back whatever software wrote, which is right for
- * an output and wrong for an input: an input reads what the other end of the
- * wire is doing. The GUI processor drives one of these. GuiCom_SndTASK sits
- * at 0x04259e2e polling port C bit 2 and only sends once it is set, so with
- * the bank alone the main processor never says anything to the panel at all.
- *
- * Until the two machines are wired together, the answer is the one a working
- * player gives: the GUI processor is fitted and ready.
+ * The bank reads back whatever software wrote, which is what section 27.2.13
+ * specifies for a general output port, and the firmware drives this bit as
+ * one: it clears it with a read-modify-write at 0x0429ab14 and sets it again
+ * at 0x0429ad06. GuiCom_SndTASK reads it at 0x04259e2e and declares the GUI
+ * processor usable only while it is *clear* - the sense is the opposite of
+ * what the earlier note here assumed. Holding it high therefore contradicted
+ * the firmware's own writes and stalled the link: the task spun for its full
+ * 10,000-tick timeout, took the failure path at 0x04259ecc, and left the
+ * ready flag at 0x049853fc zero, which is the flag the SSI interrupt handler
+ * tests before it wakes GuiCom_RcvTASK. PTDAT_C resets to H'0000, so the
+ * plain bank gives the right answer on its own.
  */
 
 static uint64_t sh7764_bank_read(void *opaque, hwaddr offset, unsigned size)
@@ -1252,9 +1251,6 @@ static uint64_t sh7764_bank_read(void *opaque, hwaddr offset, unsigned size)
         return 0;
     }
     val = b->regs[idx];
-    if (b->input_mask && offset == SH7764_PTDAT_C) {
-        val |= b->input_mask;
-    }
     trace_sh7764_bank_read(b->name, offset, val, size, sh7764_guest_pc());
     return val;
 }
@@ -1445,7 +1441,6 @@ static void sh7764_realize(DeviceState *dev, Error **errp)
                      SH7764_BSC_BASE, SH7764_BSC_SIZE);
     sh7764_bank_init(s, &s->gpio, "sh7764.gpio",
                      SH7764_GPIO_BASE, SH7764_GPIO_SIZE);
-    s->gpio.input_mask = SH7764_PTDAT_C_GUI_READY;
 
     qemu_chr_fe_set_handlers(&s->gui_chr, sh7764_ssi_can_receive,
                              sh7764_ssi_receive, NULL, NULL, s, NULL, true);

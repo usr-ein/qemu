@@ -121,8 +121,6 @@ typedef struct SH7764RegBank {
     const char *name;
     uint32_t *regs;
     unsigned nregs;
-    /* Bits held high by whatever is wired to the pins; see the read path. */
-    uint32_t input_mask;
 } SH7764RegBank;
 
 struct SH7764State {
