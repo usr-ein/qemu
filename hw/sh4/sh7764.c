@@ -1126,9 +1126,20 @@ static void sh7764_ssi_done(SH7764State *s, SH7764RegBank *b)
     if (!(dmcor & SH7764_SSI_DMCOR_RPTMD)) {
         sh7764_ssi_set(b, SH7764_SSI_DMCOR, dmcor & ~SH7764_SSI_DMCOR_EN);
     }
+    /*
+     * All three completions land together. The word count is programmed as
+     * exactly the block size times the block count - sixteen bytes a block,
+     * three blocks for the forty-eight byte answers the panel sends - so a
+     * transfer that satisfies the word count has also finished its last block
+     * and its last group of blocks. The driver's service routine tests the
+     * three separately and does different work for each, and the one that
+     * hands the buffer on is not the one that DMEND alone reaches.
+     */
     sh7764_ssi_set(b, SH7764_SSI_DMINTSR,
                    sh7764_ssi_reg(b, SH7764_SSI_DMINTSR) |
-                   SH7764_SSI_DMINT_DMEND0);
+                   SH7764_SSI_DMINT_DMEND0 |
+                   SH7764_SSI_DMINT_BLKNEND0 |
+                   SH7764_SSI_DMINT_BLKEND0);
     sh7764_ssi_update_irq(s, b);
 }
 
