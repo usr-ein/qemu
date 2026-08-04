@@ -368,16 +368,194 @@ static const MemoryRegionOps sh7764_wdt_ops = {
  */
 #define SH7764_ATAPI_TASKFILE_END  0x80
 
+/*
+ * Task file registers, table 17.3. They belong to the drive rather than to
+ * the controller, sit four bytes apart, and the manual requires longword
+ * access.
+ */
+#define SH7764_ATAPI_TF_DATA       0x00
+#define SH7764_ATAPI_TF_ERROR      0x04   /* features on write            */
+#define SH7764_ATAPI_TF_INTREASON  0x08
+#define SH7764_ATAPI_TF_BCLOW      0x10
+#define SH7764_ATAPI_TF_BCHIGH     0x14
+#define SH7764_ATAPI_TF_DEVICE     0x18
+#define SH7764_ATAPI_TF_STATUS     0x1c   /* command on write             */
+#define SH7764_ATAPI_TF_ALTSTATUS  0x38   /* device control on write      */
+
+/* ATA status register bits. */
+#define SH7764_ATA_ST_ERR          0x01
+#define SH7764_ATA_ST_DRQ          0x08
+#define SH7764_ATA_ST_DSC          0x10
+#define SH7764_ATA_ST_DF           0x20
+#define SH7764_ATA_ST_DRDY         0x40
+#define SH7764_ATA_ST_BSY          0x80
+
+/* ATAPI interrupt reason: which phase the packet protocol is in. */
+#define SH7764_ATA_IR_CD           0x01   /* a command packet, not data   */
+#define SH7764_ATA_IR_IO           0x02   /* towards the host             */
+
+/* Commands the probe issues. */
+#define SH7764_ATA_CMD_PACKET      0xa0
+#define SH7764_ATA_CMD_IDENTIFY_PK 0xa1
+
+/* Sense the drive reports with no disc loaded. */
+#define SH7764_ATAPI_SK_NOT_READY  0x02
+#define SH7764_ATAPI_ASC_NO_MEDIUM 0x3a
+
+static void sh7764_atapi_put_string(uint8_t *dst, const char *src, size_t len)
+{
+    size_t i;
+
+    /*
+     * A task file string is a sequence of 16-bit words, each holding two
+     * characters with the first in the high half, and is padded with spaces
+     * rather than terminated.
+     */
+    for (i = 0; i < len; i++) {
+        dst[i ^ 1] = *src ? *src++ : ' ';
+    }
+}
+
+static void sh7764_atapi_identify(SH7764State *s)
+{
+    uint8_t *b = s->atapi_buf;
+
+    memset(b, 0, sizeof(s->atapi_buf));
+
+    /*
+     * Word 0 for a packet device: bits 15:14 are 10 to say so, the device
+     * type in bits 12:8 is 5 for a CD-ROM, bit 7 marks the medium removable
+     * and bits 1:0 are zero for a twelve byte command packet.
+     */
+    stw_le_p(b + 0 * 2, 0x85c0);
+    sh7764_atapi_put_string(b + 10 * 2, "CDJ2KNXS0001", 20);      /* serial  */
+    sh7764_atapi_put_string(b + 23 * 2, "1.00", 8);               /* firmware*/
+    sh7764_atapi_put_string(b + 27 * 2, "PIONEER DVD-RW  DVR-105", 40);
+    stw_le_p(b + 49 * 2, 0x0300);   /* LBA and DMA supported                */
+    stw_le_p(b + 53 * 2, 0x0006);   /* words 64-70 and 88 are valid         */
+    stw_le_p(b + 63 * 2, 0x0007);   /* multiword DMA modes 0 to 2           */
+    stw_le_p(b + 64 * 2, 0x0003);   /* PIO modes 3 and 4                    */
+
+    s->atapi_pos = 0;
+    s->atapi_len = sizeof(s->atapi_buf);
+    s->atapi_bytecount = s->atapi_len;
+    s->atapi_intreason = SH7764_ATA_IR_IO;
+    s->atapi_status = SH7764_ATA_ST_DRDY | SH7764_ATA_ST_DSC |
+                      SH7764_ATA_ST_DRQ;
+}
+
+/*
+ * Answer a command packet. Nothing here reads a disc, because there is no
+ * disc: every command that needs one is refused with the sense a drive
+ * reports when its tray is empty, and the few that do not are accepted so
+ * that the probe completes rather than retrying.
+ */
+static void sh7764_atapi_do_packet(SH7764State *s)
+{
+    uint8_t op = s->atapi_packet[0];
+
+    s->atapi_pos = 0;
+    s->atapi_len = 0;
+
+    switch (op) {
+    case 0x00:  /* TEST UNIT READY   */
+    case 0x1b:  /* START STOP UNIT   */
+    case 0x1e:  /* PREVENT ALLOW     */
+    case 0x25:  /* READ CAPACITY     */
+    case 0x43:  /* READ TOC          */
+        s->atapi_error = SH7764_ATAPI_SK_NOT_READY << 4;
+        s->atapi_status = SH7764_ATA_ST_DRDY | SH7764_ATA_ST_DSC |
+                          SH7764_ATA_ST_ERR;
+        break;
+
+    case 0x03: { /* REQUEST SENSE - say why the last command was refused */
+        uint8_t *b = s->atapi_buf;
+        unsigned want = s->atapi_packet[4];
+
+        memset(b, 0, 18);
+        b[0] = 0x70;                        /* current error, fixed format */
+        b[2] = SH7764_ATAPI_SK_NOT_READY;
+        b[7] = 10;                          /* additional length           */
+        b[12] = SH7764_ATAPI_ASC_NO_MEDIUM;
+        s->atapi_len = MIN(want ? want : 18, 18);
+        s->atapi_bytecount = s->atapi_len;
+        s->atapi_intreason = SH7764_ATA_IR_IO;
+        s->atapi_status = SH7764_ATA_ST_DRDY | SH7764_ATA_ST_DSC |
+                          SH7764_ATA_ST_DRQ;
+        return;
+    }
+
+    case 0xe0:
+        /*
+         * A Pioneer vendor command the firmware issues before anything else,
+         * as E0 08 3C 00 00 00 00 00 00 04 00 00. Its meaning is not
+         * documented anywhere available, so it is accepted with no data
+         * rather than refused: refusing it is certainly wrong, since a real
+         * mechanism answers it, and accepting lets the probe finish.
+         */
+        s->atapi_status = SH7764_ATA_ST_DRDY | SH7764_ATA_ST_DSC;
+        break;
+
+    default:
+        qemu_log_mask(LOG_UNIMP, "sh7764-atapi: packet command 0x%02x\n", op);
+        s->atapi_error = SH7764_ATAPI_SK_NOT_READY << 4;
+        s->atapi_status = SH7764_ATA_ST_DRDY | SH7764_ATA_ST_DSC |
+                          SH7764_ATA_ST_ERR;
+        break;
+    }
+
+    s->atapi_intreason = SH7764_ATA_IR_CD | SH7764_ATA_IR_IO;
+}
+
 static uint64_t sh7764_atapi_read(void *opaque, hwaddr offset, unsigned size)
 {
     SH7764State *s = opaque;
     unsigned idx;
+    uint64_t val;
 
     if (offset < SH7764_ATAPI_TASKFILE_END) {
-        return 0xffffffffu >> ((4 - size) * 8);
+        switch (offset) {
+        case SH7764_ATAPI_TF_DATA:
+            val = 0xffff;
+            if (s->atapi_pos + 1 < s->atapi_len) {
+                val = lduw_le_p(s->atapi_buf + s->atapi_pos);
+            }
+            s->atapi_pos += 2;
+            if (s->atapi_pos >= s->atapi_len) {
+                s->atapi_status = SH7764_ATA_ST_DRDY | SH7764_ATA_ST_DSC;
+                s->atapi_intreason = SH7764_ATA_IR_CD | SH7764_ATA_IR_IO;
+            }
+            break;
+        case SH7764_ATAPI_TF_ERROR:
+            val = s->atapi_error;
+            break;
+        case SH7764_ATAPI_TF_INTREASON:
+            val = s->atapi_intreason;
+            break;
+        case SH7764_ATAPI_TF_BCLOW:
+            val = s->atapi_bytecount & 0xff;
+            break;
+        case SH7764_ATAPI_TF_BCHIGH:
+            val = s->atapi_bytecount >> 8;
+            break;
+        case SH7764_ATAPI_TF_DEVICE:
+            val = s->atapi_device;
+            break;
+        case SH7764_ATAPI_TF_STATUS:
+        case SH7764_ATAPI_TF_ALTSTATUS:
+            val = s->atapi_status;
+            break;
+        default:
+            val = 0xffffffffu >> ((4 - size) * 8);
+            break;
+        }
+    } else {
+        idx = (offset - SH7764_ATAPI_TASKFILE_END) / 4;
+        val = idx < ARRAY_SIZE(s->atapi_ctl) ? s->atapi_ctl[idx] : 0;
     }
-    idx = (offset - SH7764_ATAPI_TASKFILE_END) / 4;
-    return idx < ARRAY_SIZE(s->atapi_ctl) ? s->atapi_ctl[idx] : 0;
+
+    trace_sh7764_atapi_read(offset, size, val);
+    return val;
 }
 
 static void sh7764_atapi_write(void *opaque, hwaddr offset, uint64_t value,
@@ -386,8 +564,60 @@ static void sh7764_atapi_write(void *opaque, hwaddr offset, uint64_t value,
     SH7764State *s = opaque;
     unsigned idx;
 
+    trace_sh7764_atapi_write(offset, size, value);
+
     if (offset < SH7764_ATAPI_TASKFILE_END) {
-        return; /* nothing on the bus to latch it */
+        switch (offset) {
+        case SH7764_ATAPI_TF_DATA:
+            if (s->atapi_want_packet) {
+                if (s->atapi_packet_pos + 1 < sizeof(s->atapi_packet)) {
+                    stw_le_p(s->atapi_packet + s->atapi_packet_pos, value);
+                }
+                s->atapi_packet_pos += 2;
+                if (s->atapi_packet_pos >= sizeof(s->atapi_packet)) {
+                    s->atapi_want_packet = false;
+                    sh7764_atapi_do_packet(s);
+                }
+            }
+            return;
+        case SH7764_ATAPI_TF_ERROR:
+            s->atapi_features = value;
+            return;
+        case SH7764_ATAPI_TF_BCLOW:
+            s->atapi_bytecount = (s->atapi_bytecount & 0xff00) | (value & 0xff);
+            return;
+        case SH7764_ATAPI_TF_BCHIGH:
+            s->atapi_bytecount = (s->atapi_bytecount & 0x00ff) |
+                                 ((value & 0xff) << 8);
+            return;
+        case SH7764_ATAPI_TF_DEVICE:
+            s->atapi_device = value;
+            return;
+        case SH7764_ATAPI_TF_STATUS:
+            s->atapi_error = 0;
+            switch (value & 0xff) {
+            case SH7764_ATA_CMD_IDENTIFY_PK:
+                sh7764_atapi_identify(s);
+                break;
+            case SH7764_ATA_CMD_PACKET:
+                /* Ask for the twelve byte command packet. */
+                s->atapi_want_packet = true;
+                s->atapi_packet_pos = 0;
+                s->atapi_intreason = SH7764_ATA_IR_CD;
+                s->atapi_status = SH7764_ATA_ST_DRDY | SH7764_ATA_ST_DSC |
+                                  SH7764_ATA_ST_DRQ;
+                break;
+            default:
+                qemu_log_mask(LOG_UNIMP, "sh7764-atapi: command 0x%02x\n",
+                              (unsigned)(value & 0xff));
+                s->atapi_error = 0x04;    /* aborted */
+                s->atapi_status = SH7764_ATA_ST_DRDY | SH7764_ATA_ST_DSC |
+                                  SH7764_ATA_ST_ERR;
+                break;
+            }
+            return;
+        }
+        return; /* device control and the reserved holes */
     }
     idx = (offset - SH7764_ATAPI_TASKFILE_END) / 4;
     if (idx < ARRAY_SIZE(s->atapi_ctl)) {
@@ -724,6 +954,16 @@ static void sh7764_reset(DeviceState *dev)
     s->wtcnt = 0;
     s->wtcsr = 0;
     s->wrcsr = 0;
+
+    /* The drive comes up idle, ready and with nothing to hand over. */
+    s->atapi_status = SH7764_ATA_ST_DRDY | SH7764_ATA_ST_DSC;
+    s->atapi_error = 0;
+    s->atapi_intreason = SH7764_ATA_IR_CD | SH7764_ATA_IR_IO;
+    s->atapi_bytecount = 0;
+    s->atapi_pos = 0;
+    s->atapi_len = 0;
+    s->atapi_packet_pos = 0;
+    s->atapi_want_packet = false;
 
     /*
      * EXPEVT reads 0x000 after a power-on reset and 0x020 after a manual

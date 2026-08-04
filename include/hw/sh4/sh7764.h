@@ -143,6 +143,24 @@ struct SH7764State {
     MemoryRegion sdhi;
     MemoryRegion atapi;
     uint32_t atapi_ctl[0x40];
+    /*
+     * The drive behind the ATAPI controller. Only enough of it is modelled
+     * for the firmware to identify the mechanism and be told there is no
+     * disc in it: the task file, the two commands the probe issues, and a
+     * fixed sense reply.
+     */
+    uint8_t atapi_status;
+    uint8_t atapi_error;
+    uint8_t atapi_intreason;
+    uint8_t atapi_device;
+    uint8_t atapi_features;
+    uint16_t atapi_bytecount;
+    uint8_t atapi_buf[512];
+    uint32_t atapi_pos;
+    uint32_t atapi_len;
+    uint8_t atapi_packet[12];
+    uint32_t atapi_packet_pos;
+    bool atapi_want_packet;
     SH7764RegBank misc_a;
 
     /* DMAC state */
