@@ -401,37 +401,73 @@ static bool gen_cc_cmp(TCGCond cond, TCGv a, TCGv b)
     return true;
 }
 
+/*
+ * A compare is a subtraction whose result is discarded, and the data register
+ * forms report that subtraction in AZ, AN and AC0 as well as in CC (Compare
+ * Data Register, "Status Bits Affected").
+ *
+ * AN is the comparison itself rather than the sign bit of the difference: the
+ * two part company when the subtraction overflows, as for INT_MIN - 1, whose
+ * difference is positive although the operand is smaller. It follows the
+ * signedness of the comparison, so the (IU) forms report an unsigned one.
+ *
+ * Table 11-1 defines the unsigned comparison as AC0 = 0 for less than, so AC0
+ * is the carry out of a - b, that is the absence of a borrow, whatever the
+ * signedness of the compare. AC0_COPY has to read back identical to AC0.
+ *
+ * Compare Pointer leaves every status bit but CC alone, so the pointer forms
+ * call gen_cc_cmp() on its own.
+ */
+static void gen_cmp_dreg_flags(TCGv x, TCGv y, bool sgn)
+{
+    TCGv t = tcg_temp_new_i32();
+
+    tcg_gen_setcond_i32(TCG_COND_EQ, t, x, y);
+    tcg_gen_deposit_i32(cpu_astat, cpu_astat, t, R_ASTAT_AZ_SHIFT, 1);
+    tcg_gen_setcond_i32(sgn ? TCG_COND_LT : TCG_COND_LTU, t, x, y);
+    tcg_gen_deposit_i32(cpu_astat, cpu_astat, t, R_ASTAT_AN_SHIFT, 1);
+    tcg_gen_setcond_i32(TCG_COND_GEU, t, x, y);
+    tcg_gen_deposit_i32(cpu_astat, cpu_astat, t, R_ASTAT_AC0_SHIFT, 1);
+    tcg_gen_deposit_i32(cpu_astat, cpu_astat, t, R_ASTAT_AC0_COPY_SHIFT, 1);
+}
+
+static bool gen_cmp_dreg(TCGCond cond, TCGv x, TCGv y, bool sgn)
+{
+    gen_cmp_dreg_flags(x, y, sgn);
+    return gen_cc_cmp(cond, x, y);
+}
+
 static bool trans_cc_eq_dreg(DisasContext *ctx, arg_cc_eq_dreg *a)
 {
-    return gen_cc_cmp(TCG_COND_EQ, dreg(a->dst), dreg(a->src));
+    return gen_cmp_dreg(TCG_COND_EQ, dreg(a->dst), dreg(a->src), true);
 }
 
 static bool trans_cc_lt_dreg(DisasContext *ctx, arg_cc_lt_dreg *a)
 {
-    return gen_cc_cmp(TCG_COND_LT, dreg(a->dst), dreg(a->src));
+    return gen_cmp_dreg(TCG_COND_LT, dreg(a->dst), dreg(a->src), true);
 }
 
 static bool trans_cc_le_dreg(DisasContext *ctx, arg_cc_le_dreg *a)
 {
-    return gen_cc_cmp(TCG_COND_LE, dreg(a->dst), dreg(a->src));
+    return gen_cmp_dreg(TCG_COND_LE, dreg(a->dst), dreg(a->src), true);
 }
 
 static bool trans_cc_eq_imm(DisasContext *ctx, arg_cc_eq_imm *a)
 {
-    tcg_gen_setcondi_i32(TCG_COND_EQ, cpu_cc, dreg(a->dst), a->imm);
-    return true;
+    return gen_cmp_dreg(TCG_COND_EQ, dreg(a->dst),
+                        tcg_constant_i32(a->imm), true);
 }
 
 static bool trans_cc_lt_imm(DisasContext *ctx, arg_cc_lt_imm *a)
 {
-    tcg_gen_setcondi_i32(TCG_COND_LT, cpu_cc, dreg(a->dst), a->imm);
-    return true;
+    return gen_cmp_dreg(TCG_COND_LT, dreg(a->dst),
+                        tcg_constant_i32(a->imm), true);
 }
 
 static bool trans_cc_le_imm(DisasContext *ctx, arg_cc_le_imm *a)
 {
-    tcg_gen_setcondi_i32(TCG_COND_LE, cpu_cc, dreg(a->dst), a->imm);
-    return true;
+    return gen_cmp_dreg(TCG_COND_LE, dreg(a->dst),
+                        tcg_constant_i32(a->imm), true);
 }
 
 static bool trans_mov_cc_dreg(DisasContext *ctx, arg_mov_cc_dreg *a)

@@ -13,41 +13,16 @@
 /* ---------------------------------------------------------------- */
 /* Compare                                                          */
 
-/*
- * A compare is a subtraction whose result is discarded, and the data register
- * forms report that subtraction in AZ, AN and AC0 as well as in CC (Compare
- * Data Register, "Status Bits Affected"). Table 11-1 defines the unsigned
- * comparison as AC0 = 0 for less than, so AC0 is the carry out of a - b, that
- * is the absence of a borrow. AC0_COPY has to read back identical to AC0.
- *
- * Compare Pointer leaves every status bit but CC alone, so the pointer forms
- * below call gen_cc_cmp() on its own.
- */
-static void gen_cmp_dreg_flags(TCGv x, TCGv y)
-{
-    TCGv t = tcg_temp_new_i32();
-
-    tcg_gen_sub_i32(t, x, y);
-    gen_logic_flags(t);
-    tcg_gen_setcond_i32(TCG_COND_GEU, t, x, y);
-    tcg_gen_deposit_i32(cpu_astat, cpu_astat, t, R_ASTAT_AC0_SHIFT, 1);
-    tcg_gen_deposit_i32(cpu_astat, cpu_astat, t, R_ASTAT_AC0_COPY_SHIFT, 1);
-}
-
-static bool gen_cmp_dreg(TCGCond cond, TCGv x, TCGv y)
-{
-    gen_cmp_dreg_flags(x, y);
-    return gen_cc_cmp(cond, x, y);
-}
+/* The signed forms and the flag rules they share are in translate.c. */
 
 static bool trans_cc_lt_dreg_iu(DisasContext *ctx, arg_cc_lt_dreg_iu *a)
 {
-    return gen_cmp_dreg(TCG_COND_LTU, dreg(a->dst), dreg(a->src));
+    return gen_cmp_dreg(TCG_COND_LTU, dreg(a->dst), dreg(a->src), false);
 }
 
 static bool trans_cc_le_dreg_iu(DisasContext *ctx, arg_cc_le_dreg_iu *a)
 {
-    return gen_cmp_dreg(TCG_COND_LEU, dreg(a->dst), dreg(a->src));
+    return gen_cmp_dreg(TCG_COND_LEU, dreg(a->dst), dreg(a->src), false);
 }
 
 /*
@@ -56,12 +31,14 @@ static bool trans_cc_le_dreg_iu(DisasContext *ctx, arg_cc_le_dreg_iu *a)
  */
 static bool trans_cc_lt_imm_iu(DisasContext *ctx, arg_cc_lt_imm_iu *a)
 {
-    return gen_cmp_dreg(TCG_COND_LTU, dreg(a->dst), tcg_constant_i32(a->imm));
+    return gen_cmp_dreg(TCG_COND_LTU, dreg(a->dst),
+                        tcg_constant_i32(a->imm), false);
 }
 
 static bool trans_cc_le_imm_iu(DisasContext *ctx, arg_cc_le_imm_iu *a)
 {
-    return gen_cmp_dreg(TCG_COND_LEU, dreg(a->dst), tcg_constant_i32(a->imm));
+    return gen_cmp_dreg(TCG_COND_LEU, dreg(a->dst),
+                        tcg_constant_i32(a->imm), false);
 }
 
 static bool trans_cc_eq_preg(DisasContext *ctx, arg_cc_eq_preg *a)
