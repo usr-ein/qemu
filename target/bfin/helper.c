@@ -43,12 +43,56 @@ void HELPER(idle)(CPUBfinState *env)
     cpu_loop_exit(cs);
 }
 
+/*
+ * Returning from an event clears the IPEND bit that event set, and there is a
+ * separate instruction per event: RTI for the interrupt levels, RTX for an
+ * exception, RTN for NMI, RTE for emulation. RTI clears the highest priority
+ * interrupt standing in IPEND, which is the lowest numbered one, and must
+ * leave the four low bits alone - they belong to the other three and to the
+ * global disable that CLI sets.
+ *
+ * Only RTI cleared anything here, and it took the lowest set bit whatever it
+ * was. An exception handler returning with RTX therefore left IPEND bit 3
+ * standing for the rest of the run, and since an event cannot pre-empt one of
+ * equal or higher priority, nothing at IVG3 or below could ever be accepted
+ * again: the processor carried on with every interrupt latched in ILAT and
+ * none of them delivered. The GUI processor was seen in exactly that state,
+ * with IPEND 0x8 after an undefined-instruction exception.
+ *
+ * Clearing a bit can unblock something that was already latched, so the
+ * pending check has to be redone. Translated code does not hold the big lock
+ * and cpu_interrupt insists on it, hence the guard.
+ */
+static void bfin_event_return(CPUBfinState *env, uint32_t clear)
+{
+    env->ipend &= ~clear;
+
+    if (env->ilat & env->imask) {
+        BQL_LOCK_GUARD();
+        cpu_interrupt(env_cpu(env), CPU_INTERRUPT_HARD);
+    }
+}
+
 void HELPER(rti)(CPUBfinState *env)
 {
-    /* Returning from an interrupt clears its IPEND bit. */
-    if (env->ipend) {
-        env->ipend &= env->ipend - 1;
-    }
+    uint32_t levels = env->ipend & BFIN_IPEND_IVG_MASK;
+
+    bfin_event_return(env, levels & -levels);
+}
+
+void HELPER(rtx)(CPUBfinState *env)
+{
+    bfin_event_return(env, 1u << BFIN_EXCP_EVX);
+}
+
+void HELPER(rtn)(CPUBfinState *env)
+{
+    bfin_event_return(env, 1u << BFIN_EXCP_NMI);
+}
+
+void HELPER(rte)(CPUBfinState *env)
+{
+    bfin_event_return(env, 1u << BFIN_EXCP_EMU);
 }
 
 /*

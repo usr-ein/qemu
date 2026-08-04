@@ -97,6 +97,16 @@ enum {
     BFIN_NUM_EVT = 16,
 };
 
+/*
+ * The interrupt levels within IPEND, IVHW upwards. Below them sit emulation,
+ * reset, NMI and exception, each returned from by its own instruction, and
+ * bit 4, which reports that CLI has disabled interrupts globally. RTI must
+ * not touch any of those.
+ */
+enum {
+    BFIN_IPEND_IVG_MASK = 0xffe0,
+};
+
 /* Synchronous exception causes, reported in SEQSTAT.EXCAUSE. */
 #define BFIN_EXCAUSE_SINGLE_STEP   0x10
 #define BFIN_EXCAUSE_UNDEF_INSN    0x21

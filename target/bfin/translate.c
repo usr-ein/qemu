@@ -250,16 +250,19 @@ static bool trans_rti(DisasContext *ctx, arg_rti *a)
 
 static bool trans_rtx(DisasContext *ctx, arg_rtx *a)
 {
+    gen_helper_rtx(tcg_env);
     return gen_return(ctx, cpu_retx);
 }
 
 static bool trans_rtn(DisasContext *ctx, arg_rtn *a)
 {
+    gen_helper_rtn(tcg_env);
     return gen_return(ctx, cpu_retn);
 }
 
 static bool trans_rte(DisasContext *ctx, arg_rte *a)
 {
+    gen_helper_rte(tcg_env);
     return gen_return(ctx, cpu_rete);
 }
 
