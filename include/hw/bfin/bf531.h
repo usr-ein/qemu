@@ -103,6 +103,12 @@ struct BF531State {
     MemoryRegion core_mmr;
     MemoryRegion spi;
     MemoryRegion async;
+    MemoryRegion gpio;
+
+    uint16_t gpio_dir;
+    uint16_t gpio_inen;
+    uint16_t gpio_out;
+    uint16_t gpio_in;
 
     uint32_t spi_ctl;
     uint32_t spi_flg;

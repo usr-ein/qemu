@@ -197,6 +197,69 @@ static const MemoryRegionOps bf531_spi_ops = {
     .valid.max_access_size = 4,
 };
 
+/*
+ * Port F, chapter 14. Pins configured as outputs read back what was driven;
+ * pins configured as inputs read the value on the pin. Boards strap those to
+ * identify fitted options, so the value an input reads is a property.
+ */
+#define BF531_FIO_FLAG_D 0x00
+#define BF531_FIO_FLAG_C 0x04
+#define BF531_FIO_FLAG_S 0x08
+#define BF531_FIO_FLAG_T 0x0c
+#define BF531_FIO_DIR    0x30
+#define BF531_FIO_INEN   0x40
+
+static uint64_t bf531_gpio_read(void *opaque, hwaddr offset, unsigned size)
+{
+    BF531State *s = opaque;
+
+    switch (offset) {
+    case BF531_FIO_FLAG_D:
+    case BF531_FIO_FLAG_C:
+    case BF531_FIO_FLAG_S:
+    case BF531_FIO_FLAG_T:
+        return (s->gpio_out & s->gpio_dir) | (s->gpio_in & ~s->gpio_dir);
+    case BF531_FIO_DIR:
+        return s->gpio_dir;
+    case BF531_FIO_INEN:
+        return s->gpio_inen;
+    }
+    return 0;
+}
+
+static void bf531_gpio_write(void *opaque, hwaddr offset, uint64_t value,
+                             unsigned size)
+{
+    BF531State *s = opaque;
+
+    switch (offset) {
+    case BF531_FIO_FLAG_D:
+    case BF531_FIO_FLAG_T:
+        s->gpio_out = value;
+        return;
+    case BF531_FIO_FLAG_C:
+        s->gpio_out &= ~(uint16_t)value;
+        return;
+    case BF531_FIO_FLAG_S:
+        s->gpio_out |= (uint16_t)value;
+        return;
+    case BF531_FIO_DIR:
+        s->gpio_dir = value;
+        return;
+    case BF531_FIO_INEN:
+        s->gpio_inen = value;
+        return;
+    }
+}
+
+static const MemoryRegionOps bf531_gpio_ops = {
+    .read = bf531_gpio_read,
+    .write = bf531_gpio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 2,
+    .valid.max_access_size = 4,
+};
+
 static void bf531_realize(DeviceState *dev, Error **errp)
 {
     BF531State *s = BF531(dev);
@@ -248,7 +311,6 @@ static void bf531_realize(DeviceState *dev, Error **errp)
             { BF531_RTC_BASE,    "bf531.rtc" },
             { BF531_UART_BASE,   "bf531.uart" },
             { BF531_TIMER_BASE,  "bf531.timer" },
-            { BF531_GPIO_BASE,   "bf531.gpio" },
             { BF531_SPORT0_BASE, "bf531.sport0" },
             { BF531_SPORT1_BASE, "bf531.sport1" },
             { BF531_EBIU_BASE,   "bf531.ebiu" },
@@ -268,6 +330,10 @@ static void bf531_realize(DeviceState *dev, Error **errp)
      * the PPI is the parallel port that clocks pixels out, and a DMA channel
      * streams the frame buffer into it.
      */
+    memory_region_init_io(&s->gpio, OBJECT(dev), &bf531_gpio_ops, s,
+                          "bf531.gpio", BF531_PERIPH_PAGE);
+    memory_region_add_subregion(sysmem, BF531_GPIO_BASE, &s->gpio);
+
     memory_region_init_io(&s->spi, OBJECT(dev), &bf531_spi_ops, s,
                           "bf531.spi", BF531_PERIPH_PAGE);
     memory_region_add_subregion(sysmem, BF531_SPI_BASE, &s->spi);
@@ -314,6 +380,8 @@ static void bf531_init(Object *obj)
 
 static const Property bf531_properties[] = {
     DEFINE_PROP_UINT64("sdram-size", BF531State, sdram_size, 32 * MiB),
+    /* What port F reads on pins configured as inputs. */
+    DEFINE_PROP_UINT16("gpio-in", BF531State, gpio_in, 0),
 };
 
 static void bf531_class_init(ObjectClass *klass, const void *data)
