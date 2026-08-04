@@ -58,6 +58,26 @@ OBJECT_DECLARE_SIMPLE_TYPE(BF531State, BF531)
  * BF531 as the same peripheral set minus the parts it does not carry.
  */
 #define BF531_SIC_BASE          0xffc00100
+/*
+ * System interrupt controller, chapter 4 and table B-2. Offsets are from the
+ * page base: the first three words are the reset and boot registers rather
+ * than interrupt state.
+ */
+#define BF531_SWRST             0x00
+#define BF531_SYSCR             0x04
+#define BF531_SIC_RVECT         0x08
+#define BF531_SIC_IMASK         0x0c
+#define BF531_SIC_IAR0          0x10
+#define BF531_SIC_IAR1          0x14
+#define BF531_SIC_IAR2          0x18
+#define BF531_SIC_ISR           0x20
+#define BF531_SIC_IWR           0x24
+
+/* Peripheral interrupt sources, table 4-4. Only the ones used here. */
+#define BF531_SIC_ID_DMA0       8   /* PPI                              */
+#define BF531_SIC_ID_TIMER0     16
+#define BF531_SIC_SOURCES       24
+
 #define BF531_WDOG_BASE         0xffc00200
 #define BF531_RTC_BASE          0xffc00300
 #define BF531_UART_BASE         0xffc00400
@@ -105,11 +125,16 @@ struct BF531State {
     MemoryRegion spi;
     MemoryRegion async;
     MemoryRegion gpio;
+    MemoryRegion sic;
     MemoryRegion trace;
 
     QEMUTimer *core_timer;
     uint64_t core_timer_next;
     uint32_t cclk_hz;
+    /* Lines the attached panel lights; the rest are blanking. */
+    uint32_t panel_lines;
+    /* Its frame rate, which sets the DMA completion interrupt's beat. */
+    uint32_t panel_hz;
 
     uint32_t trace_base;
     uint32_t trace_size;
@@ -118,6 +143,22 @@ struct BF531State {
     uint16_t gpio_inen;
     uint16_t gpio_out;
     uint16_t gpio_in;
+
+    /*
+     * System interrupt controller. SIC_ISR latches the peripheral sources,
+     * SIC_IMASK selects which of them reach the core, and SIC_IAR assigns
+     * each source an IVG level. sic_levels remembers which core latch bits
+     * this controller is currently driving, so that lowering a source clears
+     * only what it raised and leaves software-raised events alone.
+     */
+    uint32_t sic_imask;
+    uint32_t sic_isr;
+    uint32_t sic_iwr;
+    uint32_t sic_iar[3];
+    uint32_t sic_levels;
+    uint32_t swrst;
+    uint32_t syscr;
+    qemu_irq *sic_in;
 
     uint32_t spi_ctl;
     uint32_t spi_flg;

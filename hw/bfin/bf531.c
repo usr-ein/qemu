@@ -13,6 +13,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
 #include "hw/misc/unimp.h"
+#include "hw/core/irq.h"
 #include "system/address-spaces.h"
 #include "hw/bfin/bf531.h"
 #include "qemu/timer.h"
@@ -171,6 +172,132 @@ static void bf531_core_mmr_write(void *opaque, hwaddr offset, uint64_t value,
 static const MemoryRegionOps bf531_core_mmr_ops = {
     .read = bf531_core_mmr_read,
     .write = bf531_core_mmr_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 2,
+    .valid.max_access_size = 4,
+};
+
+/*
+ * System interrupt controller, chapter 4.
+ *
+ * The core has nine general purpose interrupt levels and the part has far more
+ * peripherals than that, so the SIC sits between them: SIC_ISR latches each
+ * peripheral source, SIC_IMASK selects which ones are allowed through, and
+ * SIC_IAR gives each source a four bit level, counted from IVG7. Several
+ * sources can share a level, which is why the assignment registers exist and
+ * why the handler has to ask the peripherals who interrupted.
+ *
+ * The lines are level sensitive, so a source that goes away has to take its
+ * core latch bit with it - but only its own. The firmware raises IVG15 in
+ * software for its kernel level, and clearing that from here would lose it.
+ */
+static unsigned bf531_sic_level(BF531State *s, unsigned id)
+{
+    unsigned word = id / 8;
+    unsigned nibble = (id % 8) * 4;
+
+    return 7 + ((s->sic_iar[word] >> nibble) & 0xf);
+}
+
+static void bf531_sic_update(BF531State *s)
+{
+    CPUBfinState *env = &s->cpu.env;
+    uint32_t active = s->sic_isr & s->sic_imask;
+    uint32_t levels = 0;
+    unsigned id;
+
+    for (id = 0; id < BF531_SIC_SOURCES; id++) {
+        if (active & (1u << id)) {
+            levels |= 1u << bf531_sic_level(s, id);
+        }
+    }
+
+    env->ilat &= ~(s->sic_levels & ~levels);
+    env->ilat |= levels;
+    s->sic_levels = levels;
+
+    if (env->ilat & env->imask) {
+        cpu_interrupt(CPU(&s->cpu), CPU_INTERRUPT_HARD);
+    }
+}
+
+static void bf531_sic_set_irq(void *opaque, int id, int level)
+{
+    BF531State *s = opaque;
+
+    if (level) {
+        s->sic_isr |= 1u << id;
+    } else {
+        s->sic_isr &= ~(1u << id);
+    }
+    bf531_sic_update(s);
+}
+
+static uint64_t bf531_sic_read(void *opaque, hwaddr offset, unsigned size)
+{
+    BF531State *s = opaque;
+
+    switch (offset) {
+    case BF531_SWRST:
+        return s->swrst;
+    case BF531_SYSCR:
+        return s->syscr;
+    case BF531_SIC_RVECT:
+        return s->cpu.env.evt[BFIN_EXCP_IVG15];
+    case BF531_SIC_IMASK:
+        return s->sic_imask;
+    case BF531_SIC_IAR0:
+    case BF531_SIC_IAR1:
+    case BF531_SIC_IAR2:
+        return s->sic_iar[(offset - BF531_SIC_IAR0) / 4];
+    case BF531_SIC_ISR:
+        return s->sic_isr;
+    case BF531_SIC_IWR:
+        return s->sic_iwr;
+    }
+
+    qemu_log_mask(LOG_UNIMP, "bf531-sic: read from 0x%02" HWADDR_PRIx "\n",
+                  offset);
+    return 0;
+}
+
+static void bf531_sic_write(void *opaque, hwaddr offset, uint64_t value,
+                            unsigned size)
+{
+    BF531State *s = opaque;
+
+    switch (offset) {
+    case BF531_SWRST:
+        s->swrst = value;
+        return;
+    case BF531_SYSCR:
+        s->syscr = value;
+        return;
+    case BF531_SIC_IMASK:
+        s->sic_imask = value;
+        bf531_sic_update(s);
+        return;
+    case BF531_SIC_IAR0:
+    case BF531_SIC_IAR1:
+    case BF531_SIC_IAR2:
+        s->sic_iar[(offset - BF531_SIC_IAR0) / 4] = value;
+        bf531_sic_update(s);
+        return;
+    case BF531_SIC_IWR:
+        s->sic_iwr = value;
+        return;
+    case BF531_SIC_ISR:
+        /* Read only: a source is cleared at the peripheral that raised it. */
+        return;
+    }
+
+    qemu_log_mask(LOG_UNIMP, "bf531-sic: write to 0x%02" HWADDR_PRIx
+                  " = 0x%" PRIx64 "\n", offset, value);
+}
+
+static const MemoryRegionOps bf531_sic_ops = {
+    .read = bf531_sic_read,
+    .write = bf531_sic_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 2,
     .valid.max_access_size = 4,
@@ -405,7 +532,6 @@ static void bf531_realize(DeviceState *dev, Error **errp)
             hwaddr base;
             const char *name;
         } pages[] = {
-            { BF531_SIC_BASE,    "bf531.sic" },
             { BF531_WDOG_BASE,   "bf531.wdog" },
             { BF531_RTC_BASE,    "bf531.rtc" },
             { BF531_UART_BASE,   "bf531.uart" },
@@ -436,6 +562,11 @@ static void bf531_realize(DeviceState *dev, Error **errp)
      * the PPI is the parallel port that clocks pixels out, and a DMA channel
      * streams the frame buffer into it.
      */
+    memory_region_init_io(&s->sic, OBJECT(dev), &bf531_sic_ops, s,
+                          "bf531.sic", BF531_PERIPH_PAGE);
+    memory_region_add_subregion(sysmem, BF531_SIC_BASE, &s->sic);
+    s->sic_in = qemu_allocate_irqs(bf531_sic_set_irq, s, BF531_SIC_SOURCES);
+
     memory_region_init_io(&s->gpio, OBJECT(dev), &bf531_gpio_ops, s,
                           "bf531.gpio", BF531_PERIPH_PAGE);
     memory_region_add_subregion(sysmem, BF531_GPIO_BASE, &s->gpio);
@@ -450,9 +581,20 @@ static void bf531_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion(sysmem, BF531_DMA_BASE,
                                 sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->dma),
                                                        0));
+    /* Peripheral DMA channels 0 to 7 are SIC sources 8 to 15, table 4-4. */
+    for (i = 0; i < BFIN_DMA_CHANNELS; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->dma), i,
+                           s->sic_in[BF531_SIC_ID_DMA0 + i]);
+    }
 
     object_property_set_link(OBJECT(&s->ppi), "dma", OBJECT(&s->dma),
                              &error_abort);
+    object_property_set_uint(OBJECT(&s->ppi), "panel-lines", s->panel_lines,
+                             &error_abort);
+    if (s->panel_hz) {
+        object_property_set_uint(OBJECT(&s->ppi), "refresh-hz", s->panel_hz,
+                                 &error_abort);
+    }
     if (!sysbus_realize(SYS_BUS_DEVICE(&s->ppi), errp)) {
         return;
     }
@@ -490,16 +632,45 @@ static const Property bf531_properties[] = {
     DEFINE_PROP_UINT16("gpio-in", BF531State, gpio_in, 0),
     /* ADSP-BF531SBSTZ400: the core clock is 400 MHz. */
     DEFINE_PROP_UINT32("cclk-hz", BF531State, cclk_hz, 400000000),
+    DEFINE_PROP_UINT32("panel-lines", BF531State, panel_lines, 0),
+    DEFINE_PROP_UINT32("panel-hz", BF531State, panel_hz, 0),
     DEFINE_PROP_UINT32("trace-base", BF531State, trace_base, 0),
     DEFINE_PROP_UINT32("trace-size", BF531State, trace_size, 0),
 };
 
+/*
+ * The interrupt assignment registers do not reset to zero. Figures 4-9 to
+ * 4-11 give them a default spread of the peripherals across the general
+ * purpose levels, and firmware that is content with that spread never writes
+ * them - this one does not. Resetting them to zero instead puts every
+ * peripheral on IVG7, where the frame interrupt arrives at whatever handler
+ * happens to own the lowest level and the display never advances.
+ */
+#define BF531_SIC_IAR0_RESET 0x10000000
+#define BF531_SIC_IAR1_RESET 0x33322221
+#define BF531_SIC_IAR2_RESET 0x66655444
+
+static void bf531_reset_hold(Object *obj, ResetType type)
+{
+    BF531State *s = BF531(obj);
+
+    s->sic_imask = 0;
+    s->sic_isr = 0;
+    s->sic_iwr = 0xffffffff;
+    s->sic_levels = 0;
+    s->sic_iar[0] = BF531_SIC_IAR0_RESET;
+    s->sic_iar[1] = BF531_SIC_IAR1_RESET;
+    s->sic_iar[2] = BF531_SIC_IAR2_RESET;
+}
+
 static void bf531_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     dc->realize = bf531_realize;
     device_class_set_props(dc, bf531_properties);
+    rc->phases.hold = bf531_reset_hold;
     /* The SoC is not user-creatable: a board wires it up. */
     dc->user_creatable = false;
 }
