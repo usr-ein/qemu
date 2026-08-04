@@ -950,20 +950,53 @@ static void bfin_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
          * may be a NOP, which is what the assembler inserts when the
          * programmer supplies only one.
          *
-         * The three are issued together on hardware. Translating them in
-         * sequence is not the same thing, but the difference is only visible
-         * to a pair that reads and writes the same register, which the
-         * assembler rejects.
+         * All three issue in the same cycle, so every slot reads the register
+         * file as it stood before the instruction. Translating them one after
+         * another does not do that, and the compiler relies on the
+         * difference: it schedules a value's last use into a 16-bit store
+         * while the 32-bit slot already overwrites the register with
+         * something else. The firmware stores a thread identifier with
+         *
+         *     R0 = R0 -|- R0 || [P5] = R0 || NOP
+         *
+         * which saves the identifier and sets the zero success code in one
+         * cycle. Run in sequence, the store saves the zero.
+         *
+         * Table 20-3 restricts the 16-bit slots to loads, stores and Ireg
+         * arithmetic, so only the data registers can be written from both
+         * halves. Snapshotting those, running the wide slot, putting the old
+         * values back for the narrow slots and then reapplying only what the
+         * wide slot changed gives every slot the pre-instruction values, in
+         * both directions, whichever half writes.
+         *
+         * Comparing against the snapshot rather than tracking destinations
+         * costs nothing in correctness: a wide slot that writes a register
+         * its own value did not need to write it, and a register written by
+         * both halves at once is a conflict the assembler rejects.
          */
+        TCGv old[BFIN_NUM_DREG], new[BFIN_NUM_DREG];
         uint16_t iw1 = translator_lduw_end(cpu_env(cs), &ctx->base,
                                            ctx->pc + 2, MO_LE);
         uint16_t iw2 = translator_lduw_end(cpu_env(cs), &ctx->base,
                                            ctx->pc + 4, MO_LE);
         uint16_t iw3 = translator_lduw_end(cpu_env(cs), &ctx->base,
                                            ctx->pc + 6, MO_LE);
+        int i;
+
+        for (i = 0; i < BFIN_NUM_DREG; i++) {
+            old[i] = tcg_temp_new_i32();
+            new[i] = tcg_temp_new_i32();
+            tcg_gen_mov_i32(old[i], cpu_gpr[i]);
+        }
 
         opc = (((uint32_t)iw0 << 16) | iw1) & ~(0x0800u << 16);
         ok = decode_insn32(ctx, opc);
+
+        for (i = 0; i < BFIN_NUM_DREG; i++) {
+            tcg_gen_mov_i32(new[i], cpu_gpr[i]);
+            tcg_gen_mov_i32(cpu_gpr[i], old[i]);
+        }
+
         if (ok) {
             ok = decode_insn16(ctx, iw2);
             opc = iw2;
@@ -971,6 +1004,11 @@ static void bfin_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
         if (ok) {
             ok = decode_insn16(ctx, iw3);
             opc = iw3;
+        }
+
+        for (i = 0; i < BFIN_NUM_DREG; i++) {
+            tcg_gen_movcond_i32(TCG_COND_NE, cpu_gpr[i], new[i], old[i],
+                                new[i], cpu_gpr[i]);
         }
         break;
     }

@@ -38,6 +38,8 @@
  *   group 3   B0  B1  B2  B3  L0  L1  L2  L3
  */
 #define BFIN_NUM_GPR 32
+/* Group 0 on its own: the eight registers a parallel issue can write twice. */
+#define BFIN_NUM_DREG 8
 
 #define BFIN_REG_R0  0
 #define BFIN_REG_P0  8
