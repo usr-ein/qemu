@@ -7,11 +7,11 @@
  *
  * Chapter 9 of the ADSP-BF533 Blackfin Processor Hardware Reference rev 3.6.
  *
- * Only the register file and the descriptor-less ("autobuffer" and "stop")
- * flow modes are modelled. That is enough for the peripheral this controller
- * exists to feed here - the PPI, which streams a frame buffer continuously
- * and never actually needs the transfer to be simulated cycle by cycle,
- * because the display consumer reads guest memory directly.
+ * The transfer itself is not simulated cycle by cycle: the peripheral this
+ * controller exists to feed here is the PPI, and the display consumer reads
+ * guest memory directly. What does have to be modelled is where the transfer
+ * starts, because a channel in a descriptor flow mode never has its start
+ * address written by the processor at all - the controller fetches it.
  */
 
 #include "qemu/osdep.h"
@@ -21,6 +21,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/irq.h"
 #include "migration/vmstate.h"
+#include "exec/cpu-common.h"
 #include "hw/dma/bfin_dma.h"
 
 static BfinDMAChan *chan_of(BfinDMAState *s, hwaddr offset, hwaddr *reg)
@@ -38,6 +39,103 @@ bool bfin_dma_channel_active(BfinDMAState *s, unsigned chan)
 {
     return chan < BFIN_DMA_CHANNELS &&
            (s->chan[chan].config & BFIN_DMA_CFG_DMAEN);
+}
+
+/*
+ * Load the descriptor a channel was started on.
+ *
+ * The elements are a fixed sequence of 16-bit words and NDSIZE says how many
+ * of them the controller reads, so a descriptor carries only the fields that
+ * differ from the register file. The two flow modes that name a next
+ * descriptor start the sequence with that pointer: the large model with both
+ * halves, the small model with the low half only, taking the upper half from
+ * the pointer it was reached by. A descriptor array has no pointer at all and
+ * starts at the start address.
+ *
+ * The GUI firmware programs the frame buffer this way and never writes
+ * DMA0_START_ADDR, so without this the PPI has nothing to display.
+ */
+static void bfin_dma_fetch_descriptor(BfinDMAChan *c)
+{
+    unsigned flow = (c->config >> BFIN_DMA_CFG_FLOW_SH) & BFIN_DMA_CFG_FLOW_MSK;
+    unsigned ndsize = (c->config >> BFIN_DMA_CFG_NDSIZE_SH) &
+                      BFIN_DMA_CFG_NDSIZE_MSK;
+    uint32_t addr = c->next_desc_ptr;
+    uint16_t elem[9];
+    unsigned i, first;
+
+    switch (flow) {
+    case BFIN_DMA_FLOW_LARGE:
+        first = 0;
+        break;
+    case BFIN_DMA_FLOW_SMALL:
+        first = 1;
+        break;
+    case BFIN_DMA_FLOW_ARRAY:
+        first = 2;
+        break;
+    default:
+        return;
+    }
+
+    if (ndsize == 0 || first + ndsize > ARRAY_SIZE(elem)) {
+        return;
+    }
+
+    c->curr_desc_ptr = addr;
+    for (i = 0; i < ndsize; i++) {
+        uint8_t buf[2];
+
+        cpu_physical_memory_read(addr + i * 2, buf, sizeof(buf));
+        elem[first + i] = lduw_le_p(buf);
+    }
+
+    /*
+     * Elements past the ones fetched keep the value already in the register
+     * file, which is how a short descriptor works.
+     */
+    for (i = first + ndsize; i < ARRAY_SIZE(elem); i++) {
+        elem[i] = 0;
+    }
+
+    if (first == 0 && ndsize >= 2) {
+        c->next_desc_ptr = elem[0] | ((uint32_t)elem[1] << 16);
+    } else if (first == 1) {
+        c->next_desc_ptr = (addr & 0xffff0000) | elem[1];
+    }
+    if (first + ndsize > 3) {
+        c->start_addr = elem[2] | ((uint32_t)elem[3] << 16);
+    }
+    if (first + ndsize > 4) {
+        c->config = elem[4];
+    }
+    if (first + ndsize > 5) {
+        c->x_count = elem[5];
+    }
+    if (first + ndsize > 6) {
+        c->x_modify = elem[6];
+    }
+    if (first + ndsize > 7) {
+        c->y_count = elem[7];
+    }
+    if (first + ndsize > 8) {
+        c->y_modify = elem[8];
+    }
+}
+
+void bfin_dma_complete(BfinDMAState *s, unsigned chan)
+{
+    BfinDMAChan *c;
+
+    if (!bfin_dma_channel_active(s, chan)) {
+        return;
+    }
+
+    c = &s->chan[chan];
+    c->irq_status |= BFIN_DMA_IRQ_DONE;
+    if (c->config & BFIN_DMA_CFG_DI_EN) {
+        qemu_set_irq(s->irq[chan], 1);
+    }
 }
 
 static uint64_t bfin_dma_read(void *opaque, hwaddr offset, unsigned size)
@@ -115,6 +213,7 @@ static void bfin_dma_write(void *opaque, hwaddr offset, uint64_t value,
              * transferred here: a peripheral that consumes the stream reads
              * guest memory itself, and one that produces it has no source.
              */
+            bfin_dma_fetch_descriptor(c);
             c->curr_addr = c->start_addr;
             c->curr_x_count = c->x_count;
             c->curr_y_count = c->y_count;

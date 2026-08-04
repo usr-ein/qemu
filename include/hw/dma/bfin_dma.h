@@ -44,6 +44,19 @@ OBJECT_DECLARE_SIMPLE_TYPE(BfinDMAState, BFIN_DMA)
 #define BFIN_DMA_CFG_WDSIZE_SH  2
 #define BFIN_DMA_CFG_WDSIZE_MSK 0x3
 #define BFIN_DMA_CFG_DMA2D      (1u << 4)
+#define BFIN_DMA_CFG_DI_SEL     (1u << 6)
+#define BFIN_DMA_CFG_DI_EN      (1u << 7)   /* interrupt on completion      */
+#define BFIN_DMA_CFG_NDSIZE_SH  8
+#define BFIN_DMA_CFG_NDSIZE_MSK 0xf
+#define BFIN_DMA_CFG_FLOW_SH    12
+#define BFIN_DMA_CFG_FLOW_MSK   0x7
+
+/* DMAx_CONFIG FLOW values, table 9-6 of the hardware reference. */
+#define BFIN_DMA_FLOW_STOP      0
+#define BFIN_DMA_FLOW_AUTO      1
+#define BFIN_DMA_FLOW_ARRAY     4
+#define BFIN_DMA_FLOW_SMALL     6
+#define BFIN_DMA_FLOW_LARGE     7
 
 /* DMAx_IRQ_STATUS bits. */
 #define BFIN_DMA_IRQ_DONE       (1u << 0)
@@ -89,5 +102,13 @@ struct BfinDMAState {
  * channel is not enabled.
  */
 bool bfin_dma_channel_active(BfinDMAState *s, unsigned chan);
+
+/*
+ * Report that a channel finished the work it was started on. A peripheral
+ * that consumes the stream on its own schedule - the PPI clocking out a frame
+ * - calls this at the end of each pass so that firmware waiting on the
+ * completion interrupt runs.
+ */
+void bfin_dma_complete(BfinDMAState *s, unsigned chan);
 
 #endif /* HW_DMA_BFIN_DMA_H */
