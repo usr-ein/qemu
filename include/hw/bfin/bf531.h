@@ -15,6 +15,7 @@
 #include "target/bfin/cpu.h"
 #include "hw/dma/bfin_dma.h"
 #include "hw/display/bfin_ppi.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 
 #define TYPE_BF531 "bf531"
@@ -104,6 +105,14 @@ struct BF531State {
     MemoryRegion spi;
     MemoryRegion async;
     MemoryRegion gpio;
+    MemoryRegion trace;
+
+    QEMUTimer *core_timer;
+    uint64_t core_timer_next;
+    uint32_t cclk_hz;
+
+    uint32_t trace_base;
+    uint32_t trace_size;
 
     uint16_t gpio_dir;
     uint16_t gpio_inen;

@@ -15,6 +15,7 @@
 #include "hw/misc/unimp.h"
 #include "system/address-spaces.h"
 #include "hw/bfin/bf531.h"
+#include "qemu/timer.h"
 
 /*
  * Core memory mapped registers. These live inside the core rather than on the
@@ -23,6 +24,55 @@
  * are CPU state. Routing them through a memory region keeps the CPU model free
  * of device code.
  */
+#define BF531_TCNTL_TMPWR    (1u << 0)
+#define BF531_TCNTL_TMREN    (1u << 1)
+#define BF531_TCNTL_TAUTORLD (1u << 2)
+#define BF531_TCNTL_TINT     (1u << 3)
+
+/*
+ * The core timer decrements TCOUNT once every TSCALE + 1 core clocks and
+ * raises IVTMR when it reaches zero, reloading from TPERIOD if TAUTORLD is
+ * set. This is the tick the firmware's kernel schedules on, so without it
+ * nothing beyond the initial thread ever runs.
+ */
+static void bf531_core_timer_update(BF531State *s)
+{
+    CPUBfinState *env = &s->cpu.env;
+    uint64_t ticks, ns;
+
+    if (!(env->tcntl & BF531_TCNTL_TMPWR) ||
+        !(env->tcntl & BF531_TCNTL_TMREN) || env->tcount == 0) {
+        timer_del(s->core_timer);
+        return;
+    }
+
+    ticks = (uint64_t)env->tcount * (env->tscale + 1);
+    ns = muldiv64(ticks, NANOSECONDS_PER_SECOND, s->cclk_hz);
+    s->core_timer_next = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + ns;
+    timer_mod(s->core_timer, s->core_timer_next);
+}
+
+static void bf531_core_timer_expire(void *opaque)
+{
+    BF531State *s = opaque;
+    CPUBfinState *env = &s->cpu.env;
+
+    env->tcntl |= BF531_TCNTL_TINT;
+
+    if (env->tcntl & BF531_TCNTL_TAUTORLD) {
+        env->tcount = env->tperiod;
+    } else {
+        env->tcount = 0;
+    }
+
+    env->ilat |= 1u << BFIN_EXCP_IVTMR;
+    if (env->ilat & env->imask) {
+        cpu_interrupt(CPU(&s->cpu), CPU_INTERRUPT_HARD);
+    }
+
+    bf531_core_timer_update(s);
+}
+
 static uint64_t bf531_core_mmr_read(void *opaque, hwaddr offset, unsigned size)
 {
     BF531State *s = opaque;
@@ -88,7 +138,13 @@ static void bf531_core_mmr_write(void *opaque, hwaddr offset, uint64_t value,
         env->ilat &= ~(uint32_t)value;
         return;
     case BF531_TCNTL:
-        env->tcntl = value;
+        /* TINT is sticky and cleared by writing a one to it. */
+        if (value & BF531_TCNTL_TINT) {
+            env->tcntl &= ~BF531_TCNTL_TINT;
+        }
+        env->tcntl = (env->tcntl & BF531_TCNTL_TINT) |
+                     (value & ~BF531_TCNTL_TINT);
+        bf531_core_timer_update(s);
         return;
     case BF531_TPERIOD:
         env->tperiod = value;
@@ -98,6 +154,7 @@ static void bf531_core_mmr_write(void *opaque, hwaddr offset, uint64_t value,
         return;
     case BF531_TCOUNT:
         env->tcount = value;
+        bf531_core_timer_update(s);
         return;
     case BF531_DMEM_CONTROL:
     case BF531_IMEM_CONTROL:
@@ -260,6 +317,45 @@ static const MemoryRegionOps bf531_gpio_ops = {
     .valid.max_access_size = 4,
 };
 
+/*
+ * A debugging overlay. Placed over a range of SDRAM at higher priority, it
+ * logs every access and then performs it against the memory underneath, which
+ * makes it possible to find out what writes a particular location - something
+ * neither the monitor nor -d can do, because there are no guest watchpoints.
+ * Off unless trace-size is set.
+ */
+static uint8_t *bf531_trace_host(BF531State *s, hwaddr offset)
+{
+    return (uint8_t *)memory_region_get_ram_ptr(&s->sdram)
+           + s->trace_base + offset;
+}
+
+static uint64_t bf531_trace_read(void *opaque, hwaddr offset, unsigned size)
+{
+    BF531State *s = opaque;
+
+    return ldn_le_p(bf531_trace_host(s, offset), size);
+}
+
+static void bf531_trace_write(void *opaque, hwaddr offset, uint64_t value,
+                              unsigned size)
+{
+    BF531State *s = opaque;
+
+    qemu_log_mask(LOG_UNIMP, "TRACE %08x <= %0*" PRIx64 " size %u pc %08x\n",
+                  (uint32_t)(s->trace_base + offset), size * 2, value, size,
+                  s->cpu.env.pc);
+    stn_le_p(bf531_trace_host(s, offset), size, value);
+}
+
+static const MemoryRegionOps bf531_trace_ops = {
+    .read = bf531_trace_read,
+    .write = bf531_trace_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
 static void bf531_realize(DeviceState *dev, Error **errp)
 {
     BF531State *s = BF531(dev);
@@ -290,6 +386,9 @@ static void bf531_realize(DeviceState *dev, Error **errp)
                            BF531_L1_SCRATCH_SIZE, &error_fatal);
     memory_region_add_subregion(sysmem, BF531_L1_SCRATCH_BASE,
                                 &s->l1_scratch);
+
+    s->core_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                 bf531_core_timer_expire, s);
 
     memory_region_init_io(&s->core_mmr, OBJECT(dev), &bf531_core_mmr_ops, s,
                           "bf531.core-mmr", BF531_CORE_MMR_SIZE);
@@ -323,6 +422,13 @@ static void bf531_realize(DeviceState *dev, Error **errp)
         }
         create_unimplemented_device("bf531.sys-mmr", BF531_SYS_MMR_BASE,
                                     BF531_SYS_MMR_SIZE);
+    }
+
+    if (s->trace_size) {
+        memory_region_init_io(&s->trace, OBJECT(dev), &bf531_trace_ops, s,
+                              "bf531.trace", s->trace_size);
+        memory_region_add_subregion_overlap(sysmem, s->trace_base,
+                                            &s->trace, 1);
     }
 
     /*
@@ -382,6 +488,10 @@ static const Property bf531_properties[] = {
     DEFINE_PROP_UINT64("sdram-size", BF531State, sdram_size, 32 * MiB),
     /* What port F reads on pins configured as inputs. */
     DEFINE_PROP_UINT16("gpio-in", BF531State, gpio_in, 0),
+    /* ADSP-BF531SBSTZ400: the core clock is 400 MHz. */
+    DEFINE_PROP_UINT32("cclk-hz", BF531State, cclk_hz, 400000000),
+    DEFINE_PROP_UINT32("trace-base", BF531State, trace_base, 0),
+    DEFINE_PROP_UINT32("trace-size", BF531State, trace_size, 0),
 };
 
 static void bf531_class_init(ObjectClass *klass, const void *data)
