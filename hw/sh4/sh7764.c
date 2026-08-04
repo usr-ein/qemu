@@ -868,7 +868,7 @@ static uint64_t sh7764_bank_read(void *opaque, hwaddr offset, unsigned size)
     if (b->input_mask && offset == SH7764_PTDAT_C) {
         val |= b->input_mask;
     }
-    trace_sh7764_bank_read(b->name, offset, val, size);
+    trace_sh7764_bank_read(b->name, offset, val, size, sh7764_guest_pc());
     return val;
 }
 
@@ -881,7 +881,7 @@ static void sh7764_bank_write(void *opaque, hwaddr offset, uint64_t value,
     if (idx >= b->nregs) {
         return;
     }
-    trace_sh7764_bank_write(b->name, offset, value, size);
+    trace_sh7764_bank_write(b->name, offset, value, size, sh7764_guest_pc());
     b->regs[idx] = value;
 }
 
