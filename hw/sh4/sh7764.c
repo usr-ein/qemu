@@ -900,6 +900,10 @@ static const MemoryRegionOps sh7764_watch_ops = {
 #define SH7764_SSI_WDMCNTR   0x1020   /* receive length, in words           */
 #define SH7764_SSI_DMCOR     0x1028   /* bit 0 starts the transfer          */
 
+/* Port C bit 2 is the panel's ready line; see the note further down. */
+#define SH7764_PTDAT_C             0x48
+#define SH7764_PTDAT_C_GUI_READY   (1u << 2)
+
 #define SH7764_SSI_DMINTSR   0x1188   /* interrupt status                   */
 #define SH7764_SSI_DMINTMR   0x1190   /* interrupt mask, 1 = masked         */
 
@@ -913,7 +917,18 @@ static const MemoryRegionOps sh7764_watch_ops = {
 #define SH7764_SSI_DMINT_BLKNEND0   (1u << 3)
 #define SH7764_SSI_DMINT_BLKEND0    (1u << 4)
 #define SH7764_SSI_DMINT_CH0        0x1f
-#define SH7764_SSI_WORD      2        /* SLEN in SSICR0 says sixteen bits   */
+/*
+ * The transfer count registers are named for words and measured in bytes -
+ * sections 18.3.3 and 18.3.5 say so outright, and their low three bits are
+ * read-only because the count has to be a whole number of bursts. The block
+ * registers agree: the GUI link is programmed with sixteen bytes a block and
+ * three blocks to receive, which is the forty-eight it asks WDMCNT for, and
+ * four blocks to send, which is the sixty-four in RDMCNT.
+ *
+ * Reading them as sixteen-bit words doubled every message. The panel takes
+ * sixty-four bytes at a time, so a doubled send arrived as two messages and a
+ * doubled receive swallowed two answers as one.
+ */
 #define SH7764_SSI_MAX_XFER  65536
 
 static uint32_t sh7764_ssi_reg(SH7764RegBank *b, hwaddr off)
@@ -937,15 +952,66 @@ static void sh7764_ssi_set(SH7764RegBank *b, hwaddr off, uint32_t val)
  * Section 18.3.15: a mask bit set means masked, and every one of them comes
  * out of reset that way.
  */
-static void sh7764_ssi_update_irq(SH7764State *s, SH7764RegBank *b)
+static bool sh7764_ssi_pending(SH7764RegBank *b)
 {
     uint32_t status = sh7764_ssi_reg(b, SH7764_SSI_DMINTSR);
     uint32_t mask = sh7764_ssi_reg(b, SH7764_SSI_DMINTMR);
+
+    return (status & ~mask & SH7764_SSI_DMINT_CH0) != 0;
+}
+
+static void sh7764_ssi_update_irq(SH7764State *s, SH7764RegBank *b)
+{
     int src = (b == &s->ssi_a) ? SSI_ADMA0 : SSI_BDMA1;
 
-    qemu_set_irq(s->intc.irqs[src],
-                 (status & ~mask & SH7764_SSI_DMINT_CH0) != 0);
+    qemu_set_irq(s->intc.irqs[src], sh7764_ssi_pending(b));
 }
+
+/*
+ * INT2B4, the individual module interrupt register. Several peripherals share
+ * one priority level, and this names which of them is actually asserting.
+ *
+ * The SSI driver's service routine reads it before anything else and returns
+ * at once if its own bit is clear, so with the register absent - reading zero
+ * - the routine never recognised the interrupt it had just been entered for.
+ * The transfer went unserviced, nothing cleared the source, and the handler
+ * was simply entered again: four hundred thousand times in half a minute,
+ * while the receive channel it was supposed to re-arm stayed idle and the
+ * conversation with the panel stopped after a single exchange.
+ *
+ * Only the two DMA bits are filled in; the per-channel audio bits belong to
+ * SSI functions this player does not use.
+ */
+#define SH7764_INT2B4_SSIDMA0   (1u << 0)
+#define SH7764_INT2B4_SSIDMA1   (1u << 5)
+
+static uint64_t sh7764_int2b4_read(void *opaque, hwaddr offset, unsigned size)
+{
+    SH7764State *s = opaque;
+    uint32_t val = 0;
+
+    if (sh7764_ssi_pending(&s->ssi_a)) {
+        val |= SH7764_INT2B4_SSIDMA0;
+    }
+    if (sh7764_ssi_pending(&s->ssi_b)) {
+        val |= SH7764_INT2B4_SSIDMA1;
+    }
+    return val;
+}
+
+static void sh7764_int2b4_write(void *opaque, hwaddr offset, uint64_t value,
+                                unsigned size)
+{
+    /* Read only. */
+}
+
+static const MemoryRegionOps sh7764_int2b4_ops = {
+    .read = sh7764_int2b4_read,
+    .write = sh7764_int2b4_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
 
 /*
  * Finish a transfer the way section 18.3.6 says the hardware does: DMEND is
@@ -974,7 +1040,7 @@ static void sh7764_ssi_tx(SH7764State *s, SH7764RegBank *b)
 {
     uint32_t addr = sh7764_ssi_reg(b, SH7764_SSI_RDMADR);
     uint32_t words = sh7764_ssi_reg(b, SH7764_SSI_RDMCNTR);
-    uint32_t len = words * SH7764_SSI_WORD;
+    uint32_t len = words;
     g_autofree uint8_t *buf = NULL;
 
     if (!addr || !len || len > SH7764_SSI_MAX_XFER) {
@@ -999,8 +1065,7 @@ static void sh7764_ssi_rx_deliver(SH7764State *s)
 {
     SH7764RegBank *b = &s->ssi_a;
     uint32_t addr = sh7764_ssi_reg(b, SH7764_SSI_WDMADR);
-    uint32_t words = sh7764_ssi_reg(b, SH7764_SSI_WDMCNTR);
-    uint32_t len = words * SH7764_SSI_WORD;
+    uint32_t len = sh7764_ssi_reg(b, SH7764_SSI_WDMCNTR);
 
     if (!s->ssi_rx_armed || !addr || !len || len > sizeof(s->ssi_rx_buf)) {
         return;
@@ -1068,8 +1133,6 @@ static void sh7764_ssi_start(SH7764State *s, SH7764RegBank *b, uint32_t value)
  * Until the two machines are wired together, the answer is the one a working
  * player gives: the GUI processor is fitted and ready.
  */
-#define SH7764_PTDAT_C             0x48
-#define SH7764_PTDAT_C_GUI_READY   (1u << 2)
 
 static uint64_t sh7764_bank_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -1310,6 +1373,19 @@ static void sh7764_realize(DeviceState *dev, Error **errp)
     sh_intc_init(sysmem, &s->intc, NR_INTC_SOURCES,
                  _INTC_ARRAY(sh7764_mask_registers),
                  _INTC_ARRAY(sh7764_prio_registers));
+
+    /*
+     * INT2B4 lives with the rest of the interrupt controller, which sh_intc
+     * places at the area 7 addresses and then aliases into P4 one register at
+     * a time - the processor does not fold P4 onto area 7 by itself. Software
+     * reaches this one through P4, so it needs both.
+     */
+    memory_region_init_io(&s->int2b4, OBJECT(s), &sh7764_int2b4_ops, s,
+                          "sh7764.int2b4", 4);
+    memory_region_add_subregion(sysmem, 0x1fd40050, &s->int2b4);
+    memory_region_init_alias(&s->int2b4_p4, OBJECT(s), "sh7764.int2b4-p4",
+                             &s->int2b4, 0, 4);
+    memory_region_add_subregion(sysmem, 0xffd40050, &s->int2b4_p4);
     sh_intc_register_sources(&s->intc,
                              _INTC_ARRAY(sh7764_vectors),
                              _INTC_ARRAY(sh7764_groups));
