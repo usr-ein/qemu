@@ -303,11 +303,30 @@ static bool trans_call_l(DisasContext *ctx, arg_call_l *a)
     return true;
 }
 
+static void gen_loop_end(DisasContext *ctx);
+
+/*
+ * A conditional branch has two successors, and only one of them is a fall
+ * through. That matters at the bottom of a hardware loop: the sequencer
+ * generates the loop back when the instruction at LB completes without
+ * branching, so a branch that is taken leaves the loop and one that is not
+ * has to decrement the counter and return to the top. Emitting the loop end
+ * after this whole instruction would put it on neither path, because both
+ * ends here in a jump - which is what let a search loop written as
+ *
+ *     LSETUP(top, bottom) LC0 = P1 ;
+ *     top:    ...
+ *     bottom: IF !CC JUMP found ;
+ *
+ * run its body exactly once and then fall out as though the count had been
+ * one rather than thirty-one.
+ */
 static bool gen_cond_jump(DisasContext *ctx, bool want, int off)
 {
     TCGLabel *taken = gen_new_label();
 
     tcg_gen_brcondi_i32(want ? TCG_COND_NE : TCG_COND_EQ, cpu_cc, 0, taken);
+    gen_loop_end(ctx);
     gen_goto_tb(ctx, 0, ctx->pc_next);
     gen_set_label(taken);
     gen_goto_tb(ctx, 1, ctx->pc + off * 2);
@@ -1018,7 +1037,14 @@ static void bfin_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
         gen_undef(ctx, opc, len);
     }
 
-    gen_loop_end(ctx);
+    /*
+     * Only an instruction that falls through reaches the loop end here. One
+     * that branches has already placed the check on whichever of its paths
+     * falls through, if any.
+     */
+    if (ctx->base.is_jmp == DISAS_NEXT) {
+        gen_loop_end(ctx);
+    }
 
     ctx->base.pc_next = ctx->pc_next;
     if (ctx->base.is_jmp == DISAS_NEXT &&
