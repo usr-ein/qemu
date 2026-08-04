@@ -288,27 +288,46 @@ static bool trans_st_im_d(DisasContext *ctx, arg_st_im_d *a)
 /* ---------------------------------------------------------------- */
 /* Frame pointer relative                                           */
 
+/*
+ * The manual calls the displacement uimm7m4 and writes the syntax as
+ * [FP - uimm7m4], which reads as though the five-bit field were the magnitude
+ * divided by four. It is not: the field is negated in five bits before being
+ * scaled, so it counts *up* towards the frame pointer. Zero means FP itself
+ * and one means FP-124, which is what makes the whole 0..124 range of a
+ * seven-bit multiple of four reachable from five bits.
+ *
+ * Getting this backwards is not a small error and does not fail loudly. The
+ * firmware builds a six-field thread descriptor at FP-100 with offsets 7 to
+ * 12, and the mirrored addresses FP-28 to FP-48 are inside the same frame, so
+ * every store succeeded - into the wrong half of the frame, in reverse field
+ * order. The descriptor stayed zero and thread creation returned -17.
+ */
+static int fp_disp(int off)
+{
+    return -(((32 - off) & 31) * 4);
+}
+
 static bool trans_ld_d_fp_off(DisasContext *ctx, arg_ld_d_fp_off *a)
 {
-    gen_load(ctx, dreg(a->rd), cpu_gpr[BFIN_REG_FP], -(a->off * 4), MO_LEUL);
+    gen_load(ctx, dreg(a->rd), cpu_gpr[BFIN_REG_FP], fp_disp(a->off), MO_LEUL);
     return true;
 }
 
 static bool trans_ld_p_fp_off(DisasContext *ctx, arg_ld_p_fp_off *a)
 {
-    gen_load(ctx, preg(a->rd), cpu_gpr[BFIN_REG_FP], -(a->off * 4), MO_LEUL);
+    gen_load(ctx, preg(a->rd), cpu_gpr[BFIN_REG_FP], fp_disp(a->off), MO_LEUL);
     return true;
 }
 
 static bool trans_st_fp_off_d(DisasContext *ctx, arg_st_fp_off_d *a)
 {
-    gen_store(ctx, dreg(a->rs), cpu_gpr[BFIN_REG_FP], -(a->off * 4), MO_LEUL);
+    gen_store(ctx, dreg(a->rs), cpu_gpr[BFIN_REG_FP], fp_disp(a->off), MO_LEUL);
     return true;
 }
 
 static bool trans_st_fp_off_p(DisasContext *ctx, arg_st_fp_off_p *a)
 {
-    gen_store(ctx, preg(a->rs), cpu_gpr[BFIN_REG_FP], -(a->off * 4), MO_LEUL);
+    gen_store(ctx, preg(a->rs), cpu_gpr[BFIN_REG_FP], fp_disp(a->off), MO_LEUL);
     return true;
 }
 
