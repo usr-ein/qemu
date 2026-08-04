@@ -27,6 +27,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "hw/sh4/sh7764.h"
+#include "hw/net/sh7764_eth.h"
 #include "hw/sh4/sh.h"
 #include "hw/misc/unimp.h"
 #include "hw/sh4/sh_intc.h"
@@ -53,6 +54,7 @@ enum {
     WDT_ITI,
     ATAPI_ATAI,
     SSI_ADMA0, SSI_BDMA1,
+    ETHERC,
     /* groups */
     SCIF0, SCIF2,
     NR_INTC_SOURCES,
@@ -1240,6 +1242,7 @@ static struct intc_vect sh7764_vectors[] = {
     INTC_VECT(WDT_ITI, 0x560),
     INTC_VECT(ATAPI_ATAI, 0xc00),
     INTC_VECT(SSI_ADMA0, 0xa00), INTC_VECT(SSI_BDMA1, 0xaa0),
+    INTC_VECT(ETHERC, 0x920),
     INTC_VECT(SCIF0_ERI, 0x700), INTC_VECT(SCIF0_RXI, 0x720),
     INTC_VECT(SCIF0_BRI, 0x740), INTC_VECT(SCIF0_TXI, 0x760),
     INTC_VECT(SCIF2_ERI, 0xf00), INTC_VECT(SCIF2_RXI, 0xf20),
@@ -1268,6 +1271,8 @@ static struct intc_prio_reg sh7764_prio_registers[] = {
     { 0xffd40018, 0, 32, 8, /* INT2PRI6 */
       { ATAPI_ATAI, UNUSED, UNUSED, UNUSED } },
     { 0xffd4001c, 0, 32, 8, /* INT2PRI7 */ { SCIF2, UNUSED, UNUSED, UNUSED } },
+    { 0xffd400b0, 0, 32, 8, /* INT2PRI12 */
+      { UNUSED, UNUSED, UNUSED, ETHERC } },
 };
 
 /*
@@ -1290,7 +1295,7 @@ static struct intc_mask_reg sh7764_mask_registers[] = {
       0, true },
     { 0xffd400d4, 0xffd400d0, 32, /* INT2MSKCR1 / INT2MSKR1 */
       { 0, 0, 0, 0, 0, 0, SCIF2, 0,             /* 31..24 */
-        0, 0, 0, 0, 0, 0, 0, 0,                 /* 23..16 */
+        0, 0, 0, 0, 0, 0, 0, ETHERC,            /* 23..16 */
         0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 0 }, 0, true },
 };
@@ -1397,6 +1402,17 @@ static void sh7764_realize(DeviceState *dev, Error **errp)
     sh7764_scif_init(s, SH7764_SCIF2_BASE, 1, "scif2",
                      s->intc.irqs[SCIF2_ERI], s->intc.irqs[SCIF2_RXI],
                      s->intc.irqs[SCIF2_BRI], s->intc.irqs[SCIF2_TXI]);
+
+    /*
+     * EtherC and its DMA engine. The firmware polls this block hard - roughly
+     * 11,700 accesses in a 400-second run with nothing behind it - because it
+     * is looking for a link before it will start Pro DJ Link.
+     */
+    s->eth = qdev_new(TYPE_SH7764_ETH);
+    qemu_configure_nic_device(s->eth, true, NULL);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->eth), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->eth), 0, SH7764_ETH_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->eth), 0, s->intc.irqs[ETHERC]);
 
     /*
      * TMU channels 0 to 2. The register block is laid out exactly as the

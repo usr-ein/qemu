@@ -59,6 +59,9 @@ config VMXNET3_PCI
     default y if PCI_DEVICES
     depends on PCI
 
+config SH7764_ETH
+    bool
+
 config SMC91C111
     bool
 

@@ -18,6 +18,7 @@ system_ss.add(when: 'CONFIG_VMXNET3_PCI', if_true: files('net_tx_pkt.c', 'net_rx
 system_ss.add(when: 'CONFIG_VMXNET3_PCI', if_true: files('vmxnet3.c'))
 
 system_ss.add(when: 'CONFIG_SMC91C111', if_true: files('smc91c111.c'))
+system_ss.add(when: 'CONFIG_SH7764_ETH', if_true: files('sh7764_eth.c'))
 system_ss.add(when: 'CONFIG_LAN9118', if_true: files('lan9118.c'))
 system_ss.add(when: 'CONFIG_LAN9118_PHY', if_true: files('lan9118_phy.c'))
 system_ss.add(when: 'CONFIG_NE2000_ISA', if_true: files('ne2000-isa.c'))
