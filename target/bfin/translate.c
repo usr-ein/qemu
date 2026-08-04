@@ -303,7 +303,7 @@ static bool trans_call_l(DisasContext *ctx, arg_call_l *a)
     return true;
 }
 
-static void gen_loop_end(DisasContext *ctx);
+static void gen_loop_end(DisasContext *ctx, bool redirect);
 
 /*
  * A conditional branch has two successors, and only one of them is a fall
@@ -320,15 +320,22 @@ static void gen_loop_end(DisasContext *ctx);
  *
  * run its body exactly once and then fall out as though the count had been
  * one rather than thirty-one.
+ *
+ * The taken side spends an iteration too. It leaves by its own address rather
+ * than round the loop, but the counter still comes down, so a body that
+ * branches out on some passes and not others - a blit skipping its
+ * transparent pixels, say - would otherwise get one extra iteration for every
+ * pixel it skipped, and read that many source bytes too many.
  */
 static bool gen_cond_jump(DisasContext *ctx, bool want, int off)
 {
     TCGLabel *taken = gen_new_label();
 
     tcg_gen_brcondi_i32(want ? TCG_COND_NE : TCG_COND_EQ, cpu_cc, 0, taken);
-    gen_loop_end(ctx);
+    gen_loop_end(ctx, true);
     gen_goto_tb(ctx, 0, ctx->pc_next);
     gen_set_label(taken);
+    gen_loop_end(ctx, false);
     gen_goto_tb(ctx, 1, ctx->pc + off * 2);
     ctx->base.is_jmp = DISAS_NORETURN;
     return true;
@@ -910,15 +917,27 @@ static bool trans_bittst_n(DisasContext *ctx, arg_bittst_n *a)
 
 /*
  * Hardware loop closure. If this instruction sits at the bottom of an active
- * loop, decrement the counter and go back to the top instead of falling
- * through. Whether a loop is live is part of the translation key, so this is
- * only emitted for blocks that were translated with one.
+ * loop, the counter comes down; if it is still counting, the sequencer goes
+ * back to the top instead of falling through. Whether a loop is live is part
+ * of the translation key, so this is only emitted for blocks that were
+ * translated with one.
+ *
+ * The two halves are separable, and have to be. The counter follows the
+ * instruction at LB completing, whatever it was - a branch taken from the
+ * bottom of a loop still spends an iteration - but only an instruction that
+ * did not itself choose the next address can be sent back to the top. So a
+ * taken branch asks for the counter alone.
+ *
+ * The counters are examined from LC1 down, and a loop that is still counting
+ * stops the search: when two loops share a bottom, the inner one spends the
+ * iteration and the outer one only sees it once the inner has run out.
  */
-static void gen_loop_end(DisasContext *ctx)
+static void gen_loop_end(DisasContext *ctx, bool redirect)
 {
+    TCGLabel *done = NULL;
     int n;
 
-    for (n = 0; n < 2; n++) {
+    for (n = 1; n >= 0; n--) {
         TCGLabel *skip;
 
         if (!(ctx->tb_flags & (1 << n))) {
@@ -935,9 +954,19 @@ static void gen_loop_end(DisasContext *ctx)
          */
         tcg_gen_subi_i32(cpu_lc[n], cpu_lc[n], 1);
         tcg_gen_brcondi_i32(TCG_COND_EQ, cpu_lc[n], 0, skip);
-        tcg_gen_mov_i32(cpu_pc, cpu_lt[n]);
-        tcg_gen_lookup_and_goto_ptr();
+        if (redirect) {
+            tcg_gen_mov_i32(cpu_pc, cpu_lt[n]);
+            tcg_gen_lookup_and_goto_ptr();
+        } else {
+            if (!done) {
+                done = gen_new_label();
+            }
+            tcg_gen_br(done);
+        }
         gen_set_label(skip);
+    }
+    if (done) {
+        gen_set_label(done);
     }
 }
 
@@ -1079,7 +1108,7 @@ static void bfin_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
      * falls through, if any.
      */
     if (ctx->base.is_jmp == DISAS_NEXT) {
-        gen_loop_end(ctx);
+        gen_loop_end(ctx, true);
     }
 
     ctx->base.pc_next = ctx->pc_next;
