@@ -29,6 +29,13 @@
 #define CDJ2KNXS_GUI_PANEL_LINES  234
 
 /*
+ * Where byte 0 of the update segment sits in the GUI processor's flash: a
+ * 64 KB boot block less the 32-byte banner that ends it. See the note in
+ * cdj2knxs_gui_init.
+ */
+#define CDJ2KNXS_GUI_FLASH_SKEW   0xffe0
+
+/*
  * Pioneer prefix each update segment with a 32-byte ASCII banner, for example
  * "CDJ-2000NXS GUI Ver1.200 0234561". The LDR stream starts after it.
  */
@@ -156,8 +163,19 @@ static void cdj2knxs_gui_init(MachineState *machine)
      * past the final block the same image carries the fonts and bitmaps, and
      * the firmware reads those straight out of flash while it runs. So place
      * the whole file in asynchronous memory as well as processing its blocks.
+     *
+     * It does not start at the base of the flash. The update payload is
+     * programmed a 64 KB boot block in, and the segment's 32-byte ASCII
+     * banner occupies the last 32 bytes of that block, so byte 0 of the file
+     * belongs at 0x2000FFE0. The firmware's own asset table settles it: the
+     * first resource is at flash 0x20104240 and the compressed stream that
+     * begins there is at file offset 0x000F4260, which is 0xFFE0 lower.
+     * Getting this wrong is not subtle but it is quiet - every asset still
+     * decompresses, from the wrong bytes, so the fonts come out as another
+     * script and the bitmaps as noise.
      */
-    cpu_physical_memory_write(BF531_ASYNC_BASE, buf, len);
+    cpu_physical_memory_write(BF531_ASYNC_BASE + CDJ2KNXS_GUI_FLASH_SKEW,
+                              buf, len);
 
     blocks = cdj2knxs_gui_load_ldr(buf, len);
     if (blocks < 0) {
