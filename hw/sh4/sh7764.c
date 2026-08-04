@@ -1484,7 +1484,6 @@ static void sh7764_ssi_rx_deliver(SH7764State *s)
     s->ssi_rx_len -= len;
     memmove(s->ssi_rx_buf, s->ssi_rx_buf + len, s->ssi_rx_len);
     s->ssi_rx_armed = false;
-    s->ssi_gui_answered = true;
     qemu_log_mask(LOG_UNIMP, "sh7764-ssi: delivered %u bytes to 0x%08x\n",
                   len, addr);
     /* Before the interrupt: the handler reads both in the same breath. */
@@ -1698,42 +1697,19 @@ static bool sh7764_panel_channel(SH7764State *s, int ch, bool tx)
 /* ------------------------------------------------- generic register bank */
 
 /*
- * Port C bit 2, which gates the whole GUI conversation. This is a stand-in,
- * and the note is long because the next person needs to know how much of it
- * is measured and how much is not.
+ * Port C bit 2 is an output, not an input.
  *
- * Two tasks read the bit and they want opposite things.
- *
- *   GuiCom_SndTASK  at 0x04259e2e wants it CLEAR. That is the one and only
- *                   path that seeds the ready flag at 0x049853fc, and the
- *                   SSI handler tests that flag before it wakes the receive
- *                   task. Held high from reset, the receive task is never
- *                   woken at all - measured, over a whole boot.
- *   GuiCom_RcvTASK  at 0x04257a10 wants it SET. Clear, and it treats every
- *                   answer as a request to retransmit, prints
- *                   "GU受:☆BFから拡張部の再送要求だ!!!" and returns without
- *                   calling the message processor at 0x04311216. Held low
- *                   from reset, that is the only path it ever takes - also
- *                   measured.
- *
- * So the bit has to start low and go high. What drives it is the serial link
- * driver: 0x0429ab14 clears it when a transfer starts on channel 0, and the
- * DMA service routine sets it again at 0x0429ad06 when that transfer ends.
- * The channel is the byte at 0x04d12501, written from the first argument of
- * 0x0429aa8e, and PTG0 is the same thing for channel 1, the front panel.
- * Channel 1's transfers run constantly here; channel 0's - the caller at
- * 0x0429b0e4, whose length is capped at the forty-eight bytes of a GUI
- * message - never run at all, so neither writer is ever reached.
- *
- * Until that path works, this reports what the two readers between them
- * require: low until the GUI processor has answered, high afterwards. That is
- * defensible as behaviour - the line does say something about whether the
- * other board is talking - but it is not a model of the pin, and it should be
- * deleted the moment channel 0 transfers happen for real.
- *
- * Worth knowing while chasing that: PTIO_C resets to H'0000, which puts PTC2
- * in its alternate function, SSIDATA2. Nothing in the application image
- * programs PTIO_C, so whether this is a port pin at all is still open.
+ * The bank reads back whatever software wrote, which is what section 27.2.13
+ * specifies for a general output port, and the firmware drives this bit as
+ * one: it clears it with a read-modify-write at 0x0429ab14 and sets it again
+ * at 0x0429ad06. GuiCom_SndTASK reads it at 0x04259e2e and declares the GUI
+ * processor usable only while it is *clear* - the sense is the opposite of
+ * what the earlier note here assumed. Holding it high therefore contradicted
+ * the firmware's own writes and stalled the link: the task spun for its full
+ * 10,000-tick timeout, took the failure path at 0x04259ecc, and left the
+ * ready flag at 0x049853fc zero, which is the flag the SSI interrupt handler
+ * tests before it wakes GuiCom_RcvTASK. PTDAT_C resets to H'0000, so the
+ * plain bank gives the right answer on its own.
  */
 
 static uint64_t sh7764_bank_read(void *opaque, hwaddr offset, unsigned size)
@@ -1746,10 +1722,6 @@ static uint64_t sh7764_bank_read(void *opaque, hwaddr offset, unsigned size)
         return 0;
     }
     val = b->regs[idx];
-    if (b == &b->soc->gpio && offset == SH7764_PTDAT_C &&
-        b->soc->ssi_gui_answered) {
-        val |= SH7764_PTDAT_C_PTC2;
-    }
     trace_sh7764_bank_read(b->name, offset, val, size, sh7764_guest_pc());
     return val;
 }
@@ -2106,7 +2078,6 @@ static void sh7764_reset(DeviceState *dev)
     if (s->ssi_a.regs) {
         s->ssi_rx_len = 0;
         s->ssi_rx_armed = false;
-        s->ssi_gui_answered = false;
         sh7764_ssi_bank_reset(&s->ssi_a);
         sh7764_ssi_bank_reset(&s->ssi_b);
     }
