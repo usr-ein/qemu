@@ -877,6 +877,122 @@ static const MemoryRegionOps sh7764_watch_ops = {
     .valid.max_access_size = 4,
 };
 
+/* --------------------------------------------------------------- SSI link */
+
+/*
+ * The serial sound interface, which on this board is not sound: it is the
+ * link to the GUI processor on the TFT assembly.
+ *
+ * Each SSI has its own small DMA controller, and the firmware uses one
+ * direction of each of the two modules. SSI-A writes what arrives into
+ * memory at 0xA4500000 - the address GuiCom_RcvTASK carries in its literal
+ * pool - and SSI-B reads what is to be sent from 0xA4500800. Registers are
+ * from the SSI_DMAC list in section 18: RDMA reads out of memory, so it is
+ * the transmit direction, and WDMA writes into memory, so it is receive.
+ *
+ * The far end is the Blackfin's SPORT1, whose DMA channel 3 receives and 4
+ * transmits. Both ends move whole buffers, so that is the unit here too.
+ */
+#define SH7764_SSI_RDMADR    0x1008   /* transmit source in memory          */
+#define SH7764_SSI_RDMCNTR   0x1010   /* transmit length, in words          */
+#define SH7764_SSI_WDMADR    0x1018   /* receive destination in memory      */
+#define SH7764_SSI_WDMCNTR   0x1020   /* receive length, in words           */
+#define SH7764_SSI_DMCOR     0x1028   /* bit 0 starts the transfer          */
+
+#define SH7764_SSI_DMCOR_EN  (1u << 0)
+#define SH7764_SSI_WORD      2        /* SLEN in SSICR0 says sixteen bits   */
+#define SH7764_SSI_MAX_XFER  65536
+
+static uint32_t sh7764_ssi_reg(SH7764RegBank *b, hwaddr off)
+{
+    unsigned idx = off / 4;
+
+    return idx < b->nregs ? b->regs[idx] : 0;
+}
+
+/* Hand the transmit buffer to whatever is on the other end of the chardev. */
+static void sh7764_ssi_tx(SH7764State *s, SH7764RegBank *b)
+{
+    uint32_t addr = sh7764_ssi_reg(b, SH7764_SSI_RDMADR);
+    uint32_t words = sh7764_ssi_reg(b, SH7764_SSI_RDMCNTR);
+    uint32_t len = words * SH7764_SSI_WORD;
+    g_autofree uint8_t *buf = NULL;
+
+    if (!addr || !len || len > SH7764_SSI_MAX_XFER) {
+        return;
+    }
+
+    buf = g_malloc(len);
+    address_space_read(&address_space_memory, sh7764_dma_addr(addr),
+                       MEMTXATTRS_UNSPECIFIED, buf, len);
+    qemu_log_mask(LOG_UNIMP, "sh7764-ssi: sending %u bytes from 0x%08x\n",
+                  len, addr);
+    qemu_chr_fe_write_all(&s->gui_chr, buf, len);
+}
+
+/*
+ * Deliver what has arrived, once a receive transfer has been armed to take
+ * it. Anything beyond one transfer's worth stays queued: the far end sends
+ * whole messages and this end asks for them one at a time.
+ */
+static void sh7764_ssi_rx_deliver(SH7764State *s)
+{
+    SH7764RegBank *b = &s->ssi_a;
+    uint32_t addr = sh7764_ssi_reg(b, SH7764_SSI_WDMADR);
+    uint32_t words = sh7764_ssi_reg(b, SH7764_SSI_WDMCNTR);
+    uint32_t len = words * SH7764_SSI_WORD;
+
+    if (!s->ssi_rx_armed || !addr || !len || len > sizeof(s->ssi_rx_buf)) {
+        return;
+    }
+    if (s->ssi_rx_len < len) {
+        return;
+    }
+
+    address_space_write(&address_space_memory, sh7764_dma_addr(addr),
+                        MEMTXATTRS_UNSPECIFIED, s->ssi_rx_buf, len);
+    s->ssi_rx_len -= len;
+    memmove(s->ssi_rx_buf, s->ssi_rx_buf + len, s->ssi_rx_len);
+    s->ssi_rx_armed = false;
+    qemu_log_mask(LOG_UNIMP, "sh7764-ssi: delivered %u bytes to 0x%08x\n",
+                  len, addr);
+}
+
+static int sh7764_ssi_can_receive(void *opaque)
+{
+    SH7764State *s = opaque;
+
+    return sizeof(s->ssi_rx_buf) - s->ssi_rx_len;
+}
+
+static void sh7764_ssi_receive(void *opaque, const uint8_t *buf, int size)
+{
+    SH7764State *s = opaque;
+    int room = sizeof(s->ssi_rx_buf) - s->ssi_rx_len;
+
+    if (size > room) {
+        size = room;
+    }
+    memcpy(s->ssi_rx_buf + s->ssi_rx_len, buf, size);
+    s->ssi_rx_len += size;
+    sh7764_ssi_rx_deliver(s);
+}
+
+/* Called from the bank write path when either SSI's DMA control is set. */
+static void sh7764_ssi_start(SH7764State *s, SH7764RegBank *b, uint32_t value)
+{
+    if (!(value & SH7764_SSI_DMCOR_EN)) {
+        return;
+    }
+    if (sh7764_ssi_reg(b, SH7764_SSI_RDMCNTR)) {
+        sh7764_ssi_tx(s, b);
+    }
+    if (sh7764_ssi_reg(b, SH7764_SSI_WDMCNTR)) {
+        s->ssi_rx_armed = true;
+        sh7764_ssi_rx_deliver(s);
+    }
+}
+
 /* ------------------------------------------------- generic register bank */
 
 /*
@@ -922,6 +1038,11 @@ static void sh7764_bank_write(void *opaque, hwaddr offset, uint64_t value,
     }
     trace_sh7764_bank_write(b->name, offset, value, size, sh7764_guest_pc());
     b->regs[idx] = value;
+
+    if (offset == SH7764_SSI_DMCOR &&
+        (b == &b->soc->ssi_a || b == &b->soc->ssi_b)) {
+        sh7764_ssi_start(b->soc, b, value);
+    }
 }
 
 static const MemoryRegionOps sh7764_bank_ops = {
@@ -1073,6 +1194,9 @@ static void sh7764_realize(DeviceState *dev, Error **errp)
                      SH7764_GPIO_BASE, SH7764_GPIO_SIZE);
     s->gpio.input_mask = SH7764_PTDAT_C_GUI_READY;
 
+    qemu_chr_fe_set_handlers(&s->gui_chr, sh7764_ssi_can_receive,
+                             sh7764_ssi_receive, NULL, NULL, s, NULL, true);
+
     if (s->watch_size) {
         MemoryRegionSection sec;
 
@@ -1176,6 +1300,7 @@ static const Property sh7764_properties[] = {
      * rather than a hardcoded guess.
      */
     DEFINE_PROP_UINT32("periph-clock-hz", SH7764State, periph_freq, 50000000),
+    DEFINE_PROP_CHR("gui-chardev", SH7764State, gui_chr),
     DEFINE_PROP_UINT32("watch-base", SH7764State, watch_base, 0),
     DEFINE_PROP_UINT32("watch-size", SH7764State, watch_size, 0),
 };

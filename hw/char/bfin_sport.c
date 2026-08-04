@@ -79,6 +79,8 @@ static void bfin_sport_tx_run(BfinSPORTState *s)
 
     buf = g_malloc(len);
     cpu_physical_memory_read(c->start_addr, buf, len);
+    qemu_log_mask(LOG_UNIMP, "bfin-sport: sending %u bytes from 0x%08x\n",
+                  len, c->start_addr);
     qemu_chr_fe_write_all(&s->chr, buf, len);
     bfin_dma_complete(s->dma, s->tx_channel);
 }
@@ -105,6 +107,8 @@ static void bfin_sport_rx_deliver(BfinSPORTState *s)
         return;
     }
 
+    qemu_log_mask(LOG_UNIMP, "bfin-sport: delivering %u bytes to 0x%08x\n",
+                  len, c->start_addr);
     cpu_physical_memory_write(c->start_addr, s->rx_buf, len);
     s->rx_len -= len;
     memmove(s->rx_buf, s->rx_buf + len, s->rx_len);
@@ -128,6 +132,8 @@ static void bfin_sport_receive(void *opaque, const uint8_t *buf, int size)
     }
     memcpy(s->rx_buf + s->rx_len, buf, size);
     s->rx_len += size;
+    qemu_log_mask(LOG_UNIMP, "bfin-sport: %d bytes in, %u queued\n",
+                  size, s->rx_len);
     bfin_sport_rx_deliver(s);
 }
 

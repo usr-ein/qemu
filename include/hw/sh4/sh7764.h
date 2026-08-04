@@ -13,6 +13,7 @@
 #include "system/memory.h"
 #include "target/sh4/cpu-qom.h"
 #include "hw/sh4/sh_intc.h"
+#include "chardev/char-fe.h"
 #include "qom/object.h"
 
 #define TYPE_SH7764 "sh7764"
@@ -172,6 +173,12 @@ struct SH7764State {
     bool atapi_nien;
     bool atapi_reset;
     SH7764RegBank misc_a;
+
+    /* The link to the GUI processor; see the SSI section. */
+    CharFrontend gui_chr;
+    uint8_t ssi_rx_buf[4096];
+    uint32_t ssi_rx_len;
+    bool ssi_rx_armed;
 
     /* Optional write watch; see sh7764_watch_write. */
     MemoryRegion watch;
