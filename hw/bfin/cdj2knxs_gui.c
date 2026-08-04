@@ -139,6 +139,16 @@ static void cdj2knxs_gui_init(MachineState *machine)
         exit(1);
     }
 
+    /*
+     * The image is what is programmed into the GUI processor's own flash,
+     * DYW1815 at IC4004 on the TFTA assembly, which sits on the Blackfin's
+     * asynchronous memory bus. The boot stream is only the first part of it:
+     * past the final block the same image carries the fonts and bitmaps, and
+     * the firmware reads those straight out of flash while it runs. So place
+     * the whole file in asynchronous memory as well as processing its blocks.
+     */
+    cpu_physical_memory_write(BF531_ASYNC_BASE, buf, len);
+
     blocks = cdj2knxs_gui_load_ldr(buf, len);
     if (blocks < 0) {
         exit(1);
