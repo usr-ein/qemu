@@ -50,6 +50,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(SH7764EthState, SH7764_ETH)
  * frame was received, and a frame finished transmitting.
  */
 #define SH7764_EESR_FR          (1u << 18)
+/* ECI reflects EtherC's own status register, section 20.2.6 bit 22. */
+#define SH7764_EESR_ECI         (1u << 22)
+
+/* EtherC status: bit 2 is LCHNG, the link signal change, write 1 to clear. */
+#define SH7764_ECSR_LCHNG       (1u << 2)
+#define SH7764_ECSIPR_LCHNGIP   (1u << 2)
+
+/* ECMR, section 19.3.1. */
+#define SH7764_ECMR_DM          (1u << 1)
+#define SH7764_ECMR_TE          (1u << 5)
+#define SH7764_ECMR_RE          (1u << 6)
 #define SH7764_EESR_TC          (1u << 21)
 
 /*

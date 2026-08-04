@@ -43,9 +43,25 @@ static inline hwaddr sh7764_eth_addr(uint32_t addr)
     return addr;
 }
 
+/*
+ * EESR.ECI is not a latched bit of its own: it reports that EtherC's status
+ * register has a source the guest has enabled. Section 19.3.2 - the link
+ * change, magic packet and illegal carrier events are all funnelled through
+ * it, and the guest clears them in ECSR rather than in EESR.
+ */
+static uint32_t sh7764_eth_eesr(SH7764EthState *s)
+{
+    uint32_t v = s->eesr;
+
+    if (s->ecsr & s->ecsipr) {
+        v |= SH7764_EESR_ECI;
+    }
+    return v;
+}
+
 static void sh7764_eth_update_irq(SH7764EthState *s)
 {
-    qemu_set_irq(s->irq, (s->eesr & s->eesipr) != 0);
+    qemu_set_irq(s->irq, (sh7764_eth_eesr(s) & s->eesipr) != 0);
 }
 
 static uint32_t sh7764_eth_desc_read(hwaddr desc, unsigned word)
@@ -358,7 +374,7 @@ static uint64_t sh7764_eth_read_reg(SH7764EthState *s, hwaddr offset)
     case SH7764_ETH_EDRRR:      return s->edrrr;
     case SH7764_ETH_TDLAR:      return s->tdlar;
     case SH7764_ETH_RDLAR:      return s->rdlar;
-    case SH7764_ETH_EESR:       return s->eesr;
+    case SH7764_ETH_EESR:       return sh7764_eth_eesr(s);
     case SH7764_ETH_EESIPR:     return s->eesipr;
     case SH7764_ETH_TRSCER:     return s->trscer;
     case SH7764_ETH_ECMR:       return s->ecmr;
@@ -444,8 +460,24 @@ static void sh7764_eth_write(void *opaque, hwaddr offset, uint64_t val,
     case SH7764_ETH_TRSCER:     s->trscer = val; break;
     case SH7764_ETH_ECMR:       s->ecmr = val;   break;
     case SH7764_ETH_RFLR:       s->rflr = val;   break;
-    case SH7764_ETH_ECSR:       s->ecsr &= ~(uint32_t)val; break;
-    case SH7764_ETH_ECSIPR:     s->ecsipr = val; break;
+    case SH7764_ETH_ECSR:
+        s->ecsr &= ~(uint32_t)val;      /* write one to clear */
+        sh7764_eth_update_irq(s);
+        break;
+
+    case SH7764_ETH_ECSIPR:
+        s->ecsipr = val;
+        /*
+         * The link is up from the moment the machine starts, but a real PHY
+         * only reports the change once autonegotiation finishes - which is
+         * after the driver has enabled the interrupt. Raise LCHNG when the
+         * guest starts listening for it, so the event is not missed.
+         */
+        if (val & SH7764_ECSIPR_LCHNGIP) {
+            s->ecsr |= SH7764_ECSR_LCHNG;
+        }
+        sh7764_eth_update_irq(s);
+        break;
     case SH7764_ETH_MAHR:       s->mahr = val;   break;
     case SH7764_ETH_MALR:       s->malr = val;   break;
 
