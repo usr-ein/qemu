@@ -52,6 +52,7 @@ enum {
     /* misc */
     WDT_ITI,
     ATAPI_ATAI,
+    SSI_ADMA0, SSI_BDMA1,
     /* groups */
     SCIF0, SCIF2,
     NR_INTC_SOURCES,
@@ -899,7 +900,19 @@ static const MemoryRegionOps sh7764_watch_ops = {
 #define SH7764_SSI_WDMCNTR   0x1020   /* receive length, in words           */
 #define SH7764_SSI_DMCOR     0x1028   /* bit 0 starts the transfer          */
 
-#define SH7764_SSI_DMCOR_EN  (1u << 0)
+#define SH7764_SSI_DMINTSR   0x1188   /* interrupt status                   */
+#define SH7764_SSI_DMINTMR   0x1190   /* interrupt mask, 1 = masked         */
+
+#define SH7764_SSI_DMCOR_EN     (1u << 0)   /* DMEN                         */
+#define SH7764_SSI_DMCOR_RPTMD  (1u << 2)   /* repeat mode                  */
+
+/* Channel 0's sources sit in the low five bits; table 18.3.14. */
+#define SH7764_SSI_DMINT_RXFIFOEMP0 (1u << 0)
+#define SH7764_SSI_DMINT_TXFIFOFUL0 (1u << 1)
+#define SH7764_SSI_DMINT_DMEND0     (1u << 2)
+#define SH7764_SSI_DMINT_BLKNEND0   (1u << 3)
+#define SH7764_SSI_DMINT_BLKEND0    (1u << 4)
+#define SH7764_SSI_DMINT_CH0        0x1f
 #define SH7764_SSI_WORD      2        /* SLEN in SSICR0 says sixteen bits   */
 #define SH7764_SSI_MAX_XFER  65536
 
@@ -908,6 +921,52 @@ static uint32_t sh7764_ssi_reg(SH7764RegBank *b, hwaddr off)
     unsigned idx = off / 4;
 
     return idx < b->nregs ? b->regs[idx] : 0;
+}
+
+static void sh7764_ssi_set(SH7764RegBank *b, hwaddr off, uint32_t val)
+{
+    unsigned idx = off / 4;
+
+    if (idx < b->nregs) {
+        b->regs[idx] = val;
+    }
+}
+
+/*
+ * Raise the channel's interrupt if it has a source the mask lets through.
+ * Section 18.3.15: a mask bit set means masked, and every one of them comes
+ * out of reset that way.
+ */
+static void sh7764_ssi_update_irq(SH7764State *s, SH7764RegBank *b)
+{
+    uint32_t status = sh7764_ssi_reg(b, SH7764_SSI_DMINTSR);
+    uint32_t mask = sh7764_ssi_reg(b, SH7764_SSI_DMINTMR);
+    int src = (b == &s->ssi_a) ? SSI_ADMA0 : SSI_BDMA1;
+
+    qemu_set_irq(s->intc.irqs[src],
+                 (status & ~mask & SH7764_SSI_DMINT_CH0) != 0);
+}
+
+/*
+ * Finish a transfer the way section 18.3.6 says the hardware does: DMEND is
+ * raised once the word count has been satisfied, and DMEN clears itself when
+ * the count reaches zero outside repeat mode. Nothing polls any of this - the
+ * firmware unmasks DMEND, BLKEND and BLKNEND and then waits - so without the
+ * interrupt it arms the channel once, receives one message and never speaks
+ * again, which leaves the panel holding surface descriptors whose buffers the
+ * next command would have supplied.
+ */
+static void sh7764_ssi_done(SH7764State *s, SH7764RegBank *b)
+{
+    uint32_t dmcor = sh7764_ssi_reg(b, SH7764_SSI_DMCOR);
+
+    if (!(dmcor & SH7764_SSI_DMCOR_RPTMD)) {
+        sh7764_ssi_set(b, SH7764_SSI_DMCOR, dmcor & ~SH7764_SSI_DMCOR_EN);
+    }
+    sh7764_ssi_set(b, SH7764_SSI_DMINTSR,
+                   sh7764_ssi_reg(b, SH7764_SSI_DMINTSR) |
+                   SH7764_SSI_DMINT_DMEND0);
+    sh7764_ssi_update_irq(s, b);
 }
 
 /* Hand the transmit buffer to whatever is on the other end of the chardev. */
@@ -928,6 +987,7 @@ static void sh7764_ssi_tx(SH7764State *s, SH7764RegBank *b)
     qemu_log_mask(LOG_UNIMP, "sh7764-ssi: sending %u bytes from 0x%08x\n",
                   len, addr);
     qemu_chr_fe_write_all(&s->gui_chr, buf, len);
+    sh7764_ssi_done(s, b);
 }
 
 /*
@@ -956,6 +1016,7 @@ static void sh7764_ssi_rx_deliver(SH7764State *s)
     s->ssi_rx_armed = false;
     qemu_log_mask(LOG_UNIMP, "sh7764-ssi: delivered %u bytes to 0x%08x\n",
                   len, addr);
+    sh7764_ssi_done(s, b);
 }
 
 static int sh7764_ssi_can_receive(void *opaque)
@@ -1037,12 +1098,25 @@ static void sh7764_bank_write(void *opaque, hwaddr offset, uint64_t value,
         return;
     }
     trace_sh7764_bank_write(b->name, offset, value, size, sh7764_guest_pc());
-    b->regs[idx] = value;
 
-    if (offset == SH7764_SSI_DMCOR &&
-        (b == &b->soc->ssi_a || b == &b->soc->ssi_b)) {
-        sh7764_ssi_start(b->soc, b, value);
+    if (b == &b->soc->ssi_a || b == &b->soc->ssi_b) {
+        switch (offset) {
+        case SH7764_SSI_DMINTSR:
+            /* Writing one clears a source; writing zero is ignored. */
+            b->regs[idx] &= ~(uint32_t)value;
+            sh7764_ssi_update_irq(b->soc, b);
+            return;
+        case SH7764_SSI_DMINTMR:
+            b->regs[idx] = value;
+            sh7764_ssi_update_irq(b->soc, b);
+            return;
+        case SH7764_SSI_DMCOR:
+            b->regs[idx] = value;
+            sh7764_ssi_start(b->soc, b, value);
+            return;
+        }
     }
+    b->regs[idx] = value;
 }
 
 static const MemoryRegionOps sh7764_bank_ops = {
@@ -1102,6 +1176,7 @@ static struct intc_vect sh7764_vectors[] = {
     INTC_VECT(TUNI2, 0x5c0), INTC_VECT(TICPI2, 0x5e0),
     INTC_VECT(WDT_ITI, 0x560),
     INTC_VECT(ATAPI_ATAI, 0xc00),
+    INTC_VECT(SSI_ADMA0, 0xa00), INTC_VECT(SSI_BDMA1, 0xaa0),
     INTC_VECT(SCIF0_ERI, 0x700), INTC_VECT(SCIF0_RXI, 0x720),
     INTC_VECT(SCIF0_BRI, 0x740), INTC_VECT(SCIF0_TXI, 0x760),
     INTC_VECT(SCIF2_ERI, 0xf00), INTC_VECT(SCIF2_RXI, 0xf20),
@@ -1123,6 +1198,10 @@ static struct intc_group sh7764_groups[] = {
 static struct intc_prio_reg sh7764_prio_registers[] = {
     { 0xffd40000, 0, 32, 8, /* INT2PRI0 */ { TUNI0, TUNI1, TUNI2, TICPI2 } },
     { 0xffd40008, 0, 32, 8, /* INT2PRI2 */ { SCIF0, UNUSED, WDT_ITI, UNUSED } },
+    { 0xffd40010, 0, 32, 8, /* INT2PRI4 */
+      { UNUSED, UNUSED, SSI_ADMA0, UNUSED } },
+    { 0xffd40014, 0, 32, 8, /* INT2PRI5 */
+      { UNUSED, UNUSED, UNUSED, SSI_BDMA1 } },
     { 0xffd40018, 0, 32, 8, /* INT2PRI6 */
       { ATAPI_ATAI, UNUSED, UNUSED, UNUSED } },
     { 0xffd4001c, 0, 32, 8, /* INT2PRI7 */ { SCIF2, UNUSED, UNUSED, UNUSED } },
@@ -1142,8 +1221,8 @@ static struct intc_prio_reg sh7764_prio_registers[] = {
 static struct intc_mask_reg sh7764_mask_registers[] = {
     { 0xffd4003c, 0xffd40038, 32, /* INT2MSKCR / INT2MSKR */
       { 0, 0, 0, 0, 0, 0, 0, 0,                 /* 31..24 */
-        0, 0, 0, 0, 0, 0, 0, 0,                 /* 23..16 */
-        0, ATAPI_ATAI, 0, 0, 0, 0, 0, 0,        /* 15..8  */
+        0, 0, 0, ATAPI_ATAI, SSI_BDMA1, 0, 0, 0,        /* 23..16 */
+        0, SSI_ADMA0, 0, 0, 0, 0, 0, 0,         /* 15..8  */
         0, 0, WDT_ITI, SCIF0, 0, 0, TUNI1, TUNI0 },     /* 7..0 */
       0, true },
     { 0xffd400d4, 0xffd400d0, 32, /* INT2MSKCR1 / INT2MSKR1 */
