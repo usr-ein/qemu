@@ -25,7 +25,8 @@
 #include "system/reset.h"
 #include "hw/bfin/bf531.h"
 
-#define CDJ2KNXS_GUI_SDRAM_SIZE  (32 * MiB)
+#define CDJ2KNXS_GUI_SDRAM_SIZE   (32 * MiB)
+#define CDJ2KNXS_GUI_PANEL_LINES  234
 
 /*
  * Pioneer prefix each update segment with a 32-byte ASCII banner, for example
@@ -126,6 +127,15 @@ static void cdj2knxs_gui_init(MachineState *machine)
     object_property_add_child(OBJECT(machine), "soc", OBJECT(soc));
     object_property_set_uint(OBJECT(soc), "sdram-size", machine->ram_size,
                              &error_fatal);
+    /*
+     * The panel is the 6.1 inch wide TFT of section 6.2 of the service
+     * manual, 480 by 234. The firmware sends 255 lines per frame - timer 2,
+     * which drives the vertical sync from the pixel clock, has a period of
+     * exactly 255 line times and a pulse 21 lines wide - so the top 21 lines
+     * of every frame are blanking and never reach the glass.
+     */
+    object_property_set_uint(OBJECT(soc), "panel-lines",
+                             CDJ2KNXS_GUI_PANEL_LINES, &error_fatal);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(soc), &error_fatal);
 
     if (!fw) {

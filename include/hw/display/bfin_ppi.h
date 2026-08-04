@@ -13,6 +13,7 @@
 #include "system/memory.h"
 #include "ui/console.h"
 #include "hw/dma/bfin_dma.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 
 #define TYPE_BFIN_PPI "bfin-ppi"
@@ -32,12 +33,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(BfinPPIState, BFIN_PPI)
 #define PPI_CTL_PORT_CFG_SH 4
 #define PPI_CTL_FLD_SEL     (1u << 6)
 #define PPI_CTL_PACK_EN     (1u << 7)
-#define PPI_CTL_SKIP_EN     (1u << 8)
-#define PPI_CTL_SKIP_EO     (1u << 9)
-#define PPI_CTL_DLEN_SH     10
+#define PPI_CTL_ALT_TIMING  (1u << 8)
+#define PPI_CTL_SKIP_EN     (1u << 9)
+#define PPI_CTL_SKIP_EO     (1u << 10)
+#define PPI_CTL_DLEN_SH     11
 #define PPI_CTL_DLEN_MSK    0x7
-#define PPI_CTL_POLC        (1u << 13)
-#define PPI_CTL_POLS        (1u << 14)
+#define PPI_CTL_POLC        (1u << 14)
+#define PPI_CTL_POLS        (1u << 15)
 
 struct BfinPPIState {
     /*< private >*/
@@ -57,6 +59,26 @@ struct BfinPPIState {
 
     /* Which DMA channel streams the frame buffer. */
     uint32_t dma_channel;
+
+    /*
+     * Lines the panel actually lights. A PPI output stream carries the
+     * vertical blanking as ordinary DMA lines, so the frame the controller
+     * sends is taller than the panel; the difference is the blanking at the
+     * top of the frame and is skipped rather than displayed. Zero shows
+     * everything the controller sends, which is the right default for a panel
+     * whose active height is not known.
+     */
+    uint32_t panel_lines;
+
+    /*
+     * Frame rate of the attached panel. The PPI clocks pixels from an
+     * external PPI_CLK that nothing here models, so the rate cannot be
+     * derived from the register file; the board states it. It matters because
+     * the DMA channel raises its completion interrupt once per frame, and
+     * firmware that draws on that interrupt does not draw without it.
+     */
+    uint32_t refresh_hz;
+    QEMUTimer *frame_timer;
 
     /* Geometry currently presented, so a change can resize the window. */
     uint32_t width;
