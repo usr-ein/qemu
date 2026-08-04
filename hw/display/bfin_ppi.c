@@ -139,12 +139,21 @@ static void bfin_ppi_update_display(void *opaque)
             }
             src += w;
         } else {
+            /*
+             * Five bits each and the top bit unused, not 5:6:5. The panel's
+             * own output says so: of the pixels the firmware draws, nearly a
+             * third have all three channels equal when read this way and
+             * almost none do when read as 5:6:5, and bit 15 is only ever set
+             * on pixels that are wrong for other reasons. A greyscale user
+             * interface read with the green channel a bit out of place is
+             * exactly the confetti this used to show.
+             */
             cpu_physical_memory_read(src, line, w * 2);
             for (x = 0; x < w; x++) {
                 uint16_t v = lduw_le_p(line + x * 2);
 
-                dst[x] = rgb_to_pixel32(((v >> 11) & 0x1f) << 3,
-                                        ((v >> 5) & 0x3f) << 2,
+                dst[x] = rgb_to_pixel32(((v >> 10) & 0x1f) << 3,
+                                        ((v >> 5) & 0x1f) << 3,
                                         (v & 0x1f) << 3);
             }
             src += w * 2;
