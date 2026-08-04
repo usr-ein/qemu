@@ -99,6 +99,49 @@ static inline TCGv preg(int n)
     return cpu_gpr[BFIN_REG_P0 + n];
 }
 
+/*
+ * Close a hardware loop whose bottom is this instruction. With redirect the
+ * sequencer may also be sent back to the top; without it only the counter
+ * moves, which is what an instruction that chooses its own successor needs.
+ */
+static void gen_loop_end(DisasContext *ctx, bool redirect);
+
+/*
+ * The return address a call saves is wherever the sequencer would have gone
+ * next, which at the bottom of a hardware loop that is still counting is the
+ * top of the loop rather than the instruction after. That is what lets a loop
+ * body end in a call: each pass returns into the top and goes round again.
+ *
+ * The counter has not moved yet, so a loop with one iteration left - LC of 1,
+ * about to become zero - is already leaving and returns past the bottom.
+ */
+static void gen_call_rets(DisasContext *ctx)
+{
+    TCGLabel *done = NULL;
+    int n;
+
+    tcg_gen_movi_i32(cpu_rets, ctx->pc_next);
+    for (n = 1; n >= 0; n--) {
+        TCGLabel *skip;
+
+        if (!(ctx->tb_flags & (1 << n))) {
+            continue;
+        }
+        skip = gen_new_label();
+        tcg_gen_brcondi_i32(TCG_COND_NE, cpu_lb[n], ctx->pc, skip);
+        tcg_gen_brcondi_i32(TCG_COND_LEU, cpu_lc[n], 1, skip);
+        tcg_gen_mov_i32(cpu_rets, cpu_lt[n]);
+        if (!done) {
+            done = gen_new_label();
+        }
+        tcg_gen_br(done);
+        gen_set_label(skip);
+    }
+    if (done) {
+        gen_set_label(done);
+    }
+}
+
 static void gen_goto_tb(DisasContext *ctx, int n, uint32_t dest)
 {
     if (translator_use_goto_tb(&ctx->base, dest)) {
@@ -114,6 +157,7 @@ static void gen_goto_tb(DisasContext *ctx, int n, uint32_t dest)
 
 static void gen_jump_reg(DisasContext *ctx, TCGv dest)
 {
+    gen_loop_end(ctx, false);
     tcg_gen_mov_i32(cpu_pc, dest);
     tcg_gen_lookup_and_goto_ptr();
     ctx->base.is_jmp = DISAS_NORETURN;
@@ -243,7 +287,7 @@ static bool trans_call_p(DisasContext *ctx, arg_call_p *a)
     TCGv t = tcg_temp_new_i32();
 
     tcg_gen_mov_i32(t, preg(a->pb));
-    tcg_gen_movi_i32(cpu_rets, ctx->pc_next);
+    gen_call_rets(ctx);
     gen_jump_reg(ctx, t);
     return true;
 }
@@ -253,7 +297,7 @@ static bool trans_call_pc_p(DisasContext *ctx, arg_call_pc_p *a)
     TCGv t = tcg_temp_new_i32();
 
     tcg_gen_addi_i32(t, preg(a->pb), ctx->pc);
-    tcg_gen_movi_i32(cpu_rets, ctx->pc_next);
+    gen_call_rets(ctx);
     gen_jump_reg(ctx, t);
     return true;
 }
@@ -282,6 +326,7 @@ static bool trans_excpt(DisasContext *ctx, arg_excpt *a)
 
 static bool trans_jump_s(DisasContext *ctx, arg_jump_s *a)
 {
+    gen_loop_end(ctx, false);
     gen_goto_tb(ctx, 0, ctx->pc + a->off * 2);
     return true;
 }
@@ -290,6 +335,7 @@ static bool trans_jump_l(DisasContext *ctx, arg_jump_l *a)
 {
     int32_t off = (int32_t)((a->hi << 16) | a->lo) << 8 >> 8;
 
+    gen_loop_end(ctx, false);
     gen_goto_tb(ctx, 0, ctx->pc + off * 2);
     return true;
 }
@@ -298,12 +344,11 @@ static bool trans_call_l(DisasContext *ctx, arg_call_l *a)
 {
     int32_t off = (int32_t)((a->hi << 16) | a->lo) << 8 >> 8;
 
-    tcg_gen_movi_i32(cpu_rets, ctx->pc_next);
+    gen_call_rets(ctx);
+    gen_loop_end(ctx, false);
     gen_goto_tb(ctx, 0, ctx->pc + off * 2);
     return true;
 }
-
-static void gen_loop_end(DisasContext *ctx, bool redirect);
 
 /*
  * A conditional branch has two successors, and only one of them is a fall
