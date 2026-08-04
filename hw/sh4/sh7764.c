@@ -1611,11 +1611,27 @@ static void sh7764_panel_deliver(SH7764State *s)
          * though: padding a half-received frame out with made-up bytes would
          * lose the rest of the real one and leave the stream a frame out of
          * step from then on.
+         *
+         * What the real one would send is the state it is in, which is the
+         * last frame it sent, not "nothing pressed". The firmware arms this
+         * channel far faster than any panel produces frames - eight arms
+         * inside ten milliseconds, against a panel sending at a hundred hertz
+         * - so most arms find the buffer empty. Minting an idle frame for
+         * each of them buried the real ones about four times in five, and a
+         * button that is only seen in one frame out of five never survives
+         * the firmware's debounce: a press reached memory and still nothing
+         * happened. Repeating the last frame holds the state, which is what
+         * the hardware does. Only before anything has ever arrived is there
+         * nothing to repeat.
          */
         if (s->panel_rx_len != 0 || len > SH7764_PANEL_FRAME) {
             return;
         }
-        sh7764_panel_idle_frame(s->panel_rx_buf);
+        if (s->panel_have_last) {
+            memcpy(s->panel_rx_buf, s->panel_last, len);
+        } else {
+            sh7764_panel_idle_frame(s->panel_rx_buf);
+        }
         s->panel_rx_len = len;
     }
 
@@ -1633,6 +1649,10 @@ static void sh7764_panel_deliver(SH7764State *s)
         s->panel_rx_len -= skip;
     }
 
+    if (len <= SH7764_PANEL_FRAME) {
+        memcpy(s->panel_last, s->panel_rx_buf, len);
+        s->panel_have_last = true;
+    }
     address_space_write(&address_space_memory, sh7764_dma_addr(s->dar[ch]),
                         MEMTXATTRS_UNSPECIFIED, s->panel_rx_buf, len);
     trace_sh7764_dma_run(ch, 0, sh7764_dma_addr(s->dar[ch]), len, 1);
@@ -2078,6 +2098,8 @@ static void sh7764_reset(DeviceState *dev)
     if (s->ssi_a.regs) {
         s->ssi_rx_len = 0;
         s->ssi_rx_armed = false;
+        s->panel_rx_len = 0;
+        s->panel_have_last = false;
         sh7764_ssi_bank_reset(&s->ssi_a);
         sh7764_ssi_bank_reset(&s->ssi_b);
     }

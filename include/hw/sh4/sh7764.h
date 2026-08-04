@@ -223,6 +223,8 @@ struct SH7764State {
     CharFrontend panel_chr;
     uint8_t panel_rx_buf[SH7764_PANEL_FRAME * 4];
     uint32_t panel_rx_len;
+    uint8_t panel_last[SH7764_PANEL_FRAME];  /* the last frame really sent  */
+    bool panel_have_last;
     int32_t panel_rx_chan;              /* DMA channel armed on SCIF2 RX    */
 
     /* The link to the GUI processor; see the SSI section. */
