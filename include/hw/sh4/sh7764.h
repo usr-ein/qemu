@@ -144,6 +144,7 @@ struct SH7764State {
     SH7764RegBank ssi_a;
     SH7764RegBank ssi_b;
     MemoryRegion sdhi;
+    DeviceState *eth;
     MemoryRegion atapi;
     uint32_t atapi_ctl[0x40];
     /*
