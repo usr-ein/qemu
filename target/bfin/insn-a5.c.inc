@@ -280,24 +280,27 @@ static bool trans_vmin16(DisasContext *ctx, arg_vmin16 *a)
 }
 
 /*
- * Table 19-19: the first half named becomes the upper half of the
- * destination and the second the lower half. No status bit moves.
+ * Table 19-19: the first half named becomes the upper half of the destination
+ * and the second the lower half. The encoding numbers its two register fields
+ * the other way about - the half named first is src1 - so the upper half of
+ * the result is read from src1 and the lower half from src0. No status bit
+ * moves.
  */
-static bool gen_pack(DisasContext *ctx, int dst, int src0, int h0,
-                     int src1, int h1)
+static bool gen_pack(DisasContext *ctx, int dst, int hi_src, bool hi_half,
+                     int lo_src, bool lo_half)
 {
     TCGv hi = tcg_temp_new_i32();
     TCGv lo = tcg_temp_new_i32();
 
-    if (h0) {
-        tcg_gen_andi_i32(hi, dreg(src0), 0xffff0000);
+    if (hi_half) {
+        tcg_gen_andi_i32(hi, dreg(hi_src), 0xffff0000);
     } else {
-        tcg_gen_shli_i32(hi, dreg(src0), 16);
+        tcg_gen_shli_i32(hi, dreg(hi_src), 16);
     }
-    if (h1) {
-        tcg_gen_shri_i32(lo, dreg(src1), 16);
+    if (lo_half) {
+        tcg_gen_shri_i32(lo, dreg(lo_src), 16);
     } else {
-        tcg_gen_andi_i32(lo, dreg(src1), 0xffff);
+        tcg_gen_andi_i32(lo, dreg(lo_src), 0xffff);
     }
     tcg_gen_or_i32(dreg(dst), hi, lo);
     return true;
@@ -305,20 +308,20 @@ static bool gen_pack(DisasContext *ctx, int dst, int src0, int h0,
 
 static bool trans_pack_ll(DisasContext *ctx, arg_pack_ll *a)
 {
-    return gen_pack(ctx, a->dst, a->src0, 0, a->src1, 0);
+    return gen_pack(ctx, a->dst, a->src1, false, a->src0, false);
 }
 
 static bool trans_pack_lh(DisasContext *ctx, arg_pack_lh *a)
 {
-    return gen_pack(ctx, a->dst, a->src0, 0, a->src1, 1);
+    return gen_pack(ctx, a->dst, a->src1, false, a->src0, true);
 }
 
 static bool trans_pack_hl(DisasContext *ctx, arg_pack_hl *a)
 {
-    return gen_pack(ctx, a->dst, a->src0, 1, a->src1, 0);
+    return gen_pack(ctx, a->dst, a->src1, true, a->src0, false);
 }
 
 static bool trans_pack_hh(DisasContext *ctx, arg_pack_hh *a)
 {
-    return gen_pack(ctx, a->dst, a->src0, 1, a->src1, 1);
+    return gen_pack(ctx, a->dst, a->src1, true, a->src0, true);
 }
