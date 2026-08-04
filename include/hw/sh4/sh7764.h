@@ -66,6 +66,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(SH7764State, SH7764)
  */
 #define SH7764_MISC_A_BASE      0xffa00000
 #define SH7764_MISC_A_SIZE      0x00001000
+/*
+ * The front panel link. SCIF2 carries it, a DMA channel each way, in fixed
+ * 24-byte frames: 22 bytes of payload, a checksum byte and a 0x8F terminator.
+ */
+#define SH7764_PANEL_FRAME      24
+#define SH7764_SCIF2_SCFTDR     0xffe2000c  /* transmit FIFO data           */
+#define SH7764_SCIF2_SCFRDR     0xffe20014  /* receive FIFO data            */
+
 /* USB 2.0 host/function module, section 21. */
 #define SH7764_USB_BASE         0xfe400000
 
@@ -202,6 +210,15 @@ struct SH7764State {
     bool atapi_nien;
     bool atapi_reset;
     SH7764RegBank misc_a;
+
+    /*
+     * The link to the front panel's M16C, which carries every button, the
+     * jog wheel and the rotary encoder. See the panel section.
+     */
+    CharFrontend panel_chr;
+    uint8_t panel_rx_buf[SH7764_PANEL_FRAME];
+    uint32_t panel_rx_len;
+    int32_t panel_rx_chan;              /* DMA channel armed on SCIF2 RX    */
 
     /* The link to the GUI processor; see the SSI section. */
     CharFrontend gui_chr;

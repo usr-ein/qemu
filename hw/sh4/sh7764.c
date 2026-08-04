@@ -57,6 +57,7 @@ enum {
     SSI_ADMA0, SSI_BDMA1,
     ETHERC,
     USBI,
+    DMINT1,
     /* groups */
     SCIF0, SCIF2,
     NR_INTC_SOURCES,
@@ -97,6 +98,10 @@ static int sh7764_dma_step(uint32_t chcr, int shift, unsigned unit)
     }
 }
 
+static bool sh7764_panel_channel(SH7764State *s, int ch, bool tx);
+static void sh7764_panel_deliver(SH7764State *s);
+static void sh7764_panel_send(SH7764State *s, int ch, uint32_t count);
+
 static void sh7764_dma_run(SH7764State *s, int ch)
 {
     uint32_t chcr = s->chcr[ch];
@@ -133,6 +138,20 @@ static void sh7764_dma_run(SH7764State *s, int ch)
      * bytes; the receive direction needs the module to drive the channel.
      */
     if (rs == SH7764_CHCR_RS_DMARS && sstep == 0) {
+        if (sh7764_panel_channel(s, ch, false)) {
+            /*
+             * The panel's answers come in over a chardev rather than off a
+             * wire, so arm the channel and let them be delivered as they
+             * arrive; a frame that beat the arming is still waiting.
+             */
+            s->panel_rx_chan = ch;
+            sh7764_panel_deliver(s);
+        }
+        return;
+    }
+
+    if (sh7764_panel_channel(s, ch, true)) {
+        sh7764_panel_send(s, ch, count);
         return;
     }
 
@@ -1312,6 +1331,110 @@ static void sh7764_ssi_start(SH7764State *s, SH7764RegBank *b, uint32_t value)
     }
 }
 
+
+/* ----------------------------------------------------------- panel link */
+
+/*
+ * The front panel's M16C.
+ *
+ * Every button, the jog wheel and the rotary encoder come in over SCIF2 in
+ * fixed 24-byte frames, moved by a DMA channel each way: channel 0 out to
+ * SCFTDR2 and channel 1 in from SCFRDR2, both selected through DMARS0. The
+ * frame is 22 bytes of payload, a checksum byte and 0x8F; the firmware's
+ * decoder at 0x042f3e76 rejects anything whose last byte is not 0x8F or whose
+ * checksum - an eight-bit sum of the payload with end-around carry - does not
+ * match, so a frame has to be well formed to be seen at all.
+ *
+ * The transfers are carried here rather than through the UART model because
+ * the DMA is what moves them: a peripheral-request channel is paced by the
+ * module it names, and nothing in the SCIF model can drive one. Bytes still
+ * arrive and leave through a chardev, so the other end is whatever the user
+ * connects - tools/cdjpanel.py, or anything else that speaks the frame.
+ */
+
+static int sh7764_panel_can_receive(void *opaque)
+{
+    SH7764State *s = opaque;
+
+    return sizeof(s->panel_rx_buf) - s->panel_rx_len;
+}
+
+/* Hand a complete frame to the armed channel, if both are ready. */
+static void sh7764_panel_deliver(SH7764State *s)
+{
+    int ch = s->panel_rx_chan;
+    uint32_t len;
+
+    if (ch < 0 || !(s->chcr[ch] & SH7764_CHCR_DE)) {
+        return;                         /* nothing armed; hold the frame */
+    }
+
+    len = s->tcr[ch] ? s->tcr[ch] : sizeof(s->panel_rx_buf);
+    if (s->panel_rx_len < len) {
+        return;                         /* wait for the whole frame */
+    }
+
+    address_space_write(&address_space_memory, sh7764_dma_addr(s->dar[ch]),
+                        MEMTXATTRS_UNSPECIFIED, s->panel_rx_buf, len);
+    trace_sh7764_dma_run(ch, 0, sh7764_dma_addr(s->dar[ch]), len, 1);
+
+    s->panel_rx_len -= len;
+    if (s->panel_rx_len) {
+        memmove(s->panel_rx_buf, s->panel_rx_buf + len, s->panel_rx_len);
+    }
+
+    s->tcr[ch] = 0;
+    s->dar[ch] += len;
+    s->chcr[ch] = (s->chcr[ch] | SH7764_CHCR_TE) & ~SH7764_CHCR_DE;
+    s->panel_rx_chan = -1;
+    qemu_irq_pulse(s->intc.irqs[DMINT1]);
+}
+
+static void sh7764_panel_receive(void *opaque, const uint8_t *buf, int size)
+{
+    SH7764State *s = opaque;
+
+    if (size <= 0) {
+        return;
+    }
+    if (s->panel_rx_len + size > sizeof(s->panel_rx_buf)) {
+        size = sizeof(s->panel_rx_buf) - s->panel_rx_len;
+    }
+    memcpy(s->panel_rx_buf + s->panel_rx_len, buf, size);
+    s->panel_rx_len += size;
+    sh7764_panel_deliver(s);
+}
+
+/* Send a frame the firmware has handed to the transmit channel. */
+static void sh7764_panel_send(SH7764State *s, int ch, uint32_t count)
+{
+    uint8_t buf[SH7764_PANEL_FRAME];
+    uint32_t len = MIN(count, sizeof(buf));
+
+    address_space_read(&address_space_memory, sh7764_dma_addr(s->sar[ch]),
+                       MEMTXATTRS_UNSPECIFIED, buf, len);
+    trace_sh7764_dma_run(ch, sh7764_dma_addr(s->sar[ch]), 0, len, 1);
+    qemu_chr_fe_write_all(&s->panel_chr, buf, len);
+
+    s->sar[ch] += len;
+    s->tcr[ch] = 0;
+    s->chcr[ch] = (s->chcr[ch] | SH7764_CHCR_TE) & ~SH7764_CHCR_DE;
+    qemu_irq_pulse(s->intc.irqs[DMINT1]);
+}
+
+/* True if this channel is the panel link, in the given direction. */
+static bool sh7764_panel_channel(SH7764State *s, int ch, bool tx)
+{
+    uint32_t chcr = s->chcr[ch];
+    unsigned rs = (chcr >> SH7764_CHCR_RS_SHIFT) & SH7764_CHCR_RS_MASK;
+
+    if (rs != SH7764_CHCR_RS_DMARS) {
+        return false;
+    }
+    return tx ? s->dar[ch] == SH7764_SCIF2_SCFTDR
+              : s->sar[ch] == SH7764_SCIF2_SCFRDR;
+}
+
 /* ------------------------------------------------- generic register bank */
 
 /*
@@ -1435,6 +1558,7 @@ static struct intc_vect sh7764_vectors[] = {
     INTC_VECT(SSI_ADMA0, 0xa00), INTC_VECT(SSI_BDMA1, 0xaa0),
     INTC_VECT(ETHERC, 0x920),
     INTC_VECT(USBI, 0xc60),
+    INTC_VECT(DMINT1, 0x660),
     INTC_VECT(SCIF0_ERI, 0x700), INTC_VECT(SCIF0_RXI, 0x720),
     INTC_VECT(SCIF0_BRI, 0x740), INTC_VECT(SCIF0_TXI, 0x760),
     INTC_VECT(SCIF2_ERI, 0xf00), INTC_VECT(SCIF2_RXI, 0xf20),
@@ -1456,6 +1580,8 @@ static struct intc_group sh7764_groups[] = {
 static struct intc_prio_reg sh7764_prio_registers[] = {
     { 0xffd40000, 0, 32, 8, /* INT2PRI0 */ { TUNI0, TUNI1, TUNI2, TICPI2 } },
     { 0xffd40008, 0, 32, 8, /* INT2PRI2 */ { SCIF0, UNUSED, WDT_ITI, UNUSED } },
+    { 0xffd4000c, 0, 32, 8, /* INT2PRI3 */
+      { UNUSED, DMINT1, UNUSED, UNUSED } },
     { 0xffd40010, 0, 32, 8, /* INT2PRI4 */
       { UNUSED, UNUSED, SSI_ADMA0, UNUSED } },
     { 0xffd40014, 0, 32, 8, /* INT2PRI5 */
@@ -1482,7 +1608,7 @@ static struct intc_mask_reg sh7764_mask_registers[] = {
     { 0xffd4003c, 0xffd40038, 32, /* INT2MSKCR / INT2MSKR */
       { 0, 0, 0, 0, 0, 0, 0, 0,                 /* 31..24 */
         0, 0, 0, ATAPI_ATAI, SSI_BDMA1, 0, 0, 0,        /* 23..16 */
-        0, SSI_ADMA0, 0, 0, 0, 0, 0, 0,         /* 15..8  */
+        0, SSI_ADMA0, 0, 0, 0, 0, 0, DMINT1,    /* 15..8  */
         0, 0, WDT_ITI, SCIF0, 0, 0, TUNI1, TUNI0 },     /* 7..0 */
       0, true },
     { 0xffd400d4, 0xffd400d0, 32, /* INT2MSKCR1 / INT2MSKR1 */
@@ -1534,6 +1660,10 @@ static void sh7764_realize(DeviceState *dev, Error **errp)
 
     qemu_chr_fe_set_handlers(&s->gui_chr, sh7764_ssi_can_receive,
                              sh7764_ssi_receive, NULL, NULL, s, NULL, true);
+
+    s->panel_rx_chan = -1;
+    qemu_chr_fe_set_handlers(&s->panel_chr, sh7764_panel_can_receive,
+                             sh7764_panel_receive, NULL, NULL, s, NULL, true);
 
     if (s->watch_size) {
         MemoryRegionSection sec;
@@ -1677,6 +1807,7 @@ static const Property sh7764_properties[] = {
      */
     DEFINE_PROP_UINT32("periph-clock-hz", SH7764State, periph_freq, 50000000),
     DEFINE_PROP_CHR("gui-chardev", SH7764State, gui_chr),
+    DEFINE_PROP_CHR("panel-chardev", SH7764State, panel_chr),
     DEFINE_PROP_UINT32("watch-base", SH7764State, watch_base, 0),
     DEFINE_PROP_UINT32("watch-size", SH7764State, watch_size, 0),
 };
