@@ -1403,6 +1403,43 @@ static int sh7764_panel_can_receive(void *opaque)
     return sizeof(s->panel_rx_buf) - s->panel_rx_len;
 }
 
+/*
+ * The frame a panel with nothing touched on it sends.
+ *
+ * A button pulls its line down, so a released one reads as 1 and an idle
+ * panel is all ones; the checksum of twenty-two 0xFF bytes folds back to 0xFF.
+ * The M16C starts sending this the moment it is out of reset, long before the
+ * main processor asks anything of it, so the firmware never sees a blank
+ * panel - and it does read the panel early, to decide whether the operator is
+ * holding the combination that asks for a firmware update. This model has to
+ * do the same or that decision is made against a buffer of zeros, which is
+ * every button at once.
+ */
+static void sh7764_panel_idle_frame(uint8_t *frame)
+{
+    unsigned i;
+    uint8_t sum = 0;
+
+    /*
+     * Only the bytes the firmware reads as buttons are all ones. The unpacker
+     * at 0x042f5834 takes bytes 4 to 11 as four sixteen-bit words of button
+     * state and byte 15 as individual switches; the rest are counts and
+     * fields, where 0xFF is a value rather than "not pressed", and bytes 0 and
+     * 1 it does not read at all.
+     */
+    memset(frame, 0, SH7764_PANEL_FRAME);
+    memset(frame + 4, 0xff, 8);
+    frame[15] = 0xff;
+
+    for (i = 0; i < SH7764_PANEL_FRAME - 2; i++) {
+        unsigned t = sum + frame[i];
+
+        sum = t > 0xff ? (t & 0xff) + 1 : t;    /* end-around carry */
+    }
+    frame[SH7764_PANEL_FRAME - 2] = sum;
+    frame[SH7764_PANEL_FRAME - 1] = 0x8f;
+}
+
 /* Hand a complete frame to the armed channel, if both are ready. */
 static void sh7764_panel_deliver(SH7764State *s)
 {
@@ -1415,7 +1452,19 @@ static void sh7764_panel_deliver(SH7764State *s)
 
     len = s->tcr[ch] ? s->tcr[ch] : SH7764_PANEL_FRAME;
     if (s->panel_rx_len < len) {
-        return;                         /* wait for the whole frame */
+        /*
+         * Nothing whole has arrived from whatever is playing the panel, so
+         * answer as the real one would - it is always sending - rather than
+         * leave the buffer as it was found. Only when the buffer is empty,
+         * though: padding a half-received frame out with made-up bytes would
+         * lose the rest of the real one and leave the stream a frame out of
+         * step from then on.
+         */
+        if (s->panel_rx_len != 0 || len > SH7764_PANEL_FRAME) {
+            return;
+        }
+        sh7764_panel_idle_frame(s->panel_rx_buf);
+        s->panel_rx_len = len;
     }
 
     /*
