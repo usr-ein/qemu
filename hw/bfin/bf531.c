@@ -469,9 +469,10 @@ static void bf531_trace_write(void *opaque, hwaddr offset, uint64_t value,
 {
     BF531State *s = opaque;
 
-    qemu_log_mask(LOG_UNIMP, "TRACE %08x <= %0*" PRIx64 " size %u pc %08x\n",
+    qemu_log_mask(LOG_UNIMP,
+                  "TRACE %08x <= %0*" PRIx64 " size %u pc %08x rets %08x\n",
                   (uint32_t)(s->trace_base + offset), size * 2, value, size,
-                  s->cpu.env.pc);
+                  s->cpu.env.pc, s->cpu.env.rets);
     stn_le_p(bf531_trace_host(s, offset), size, value);
 }
 
