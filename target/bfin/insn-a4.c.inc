@@ -269,20 +269,47 @@ static void gen_shift_by_mag(TCGv dst, TCGv src, TCGv magreg, int width,
     tcg_gen_movcond_i32(TCG_COND_GE, res, mag, zero, rl, rr);
 
     /*
-     * Only a left shift can lose significant bits, and only the arithmetic
-     * form reports it; the logical form clears V.
+     * Only a left shift can lose significant bits, and it reports the loss in
+     * V whether it is written as the logical or the arithmetic form: a left
+     * shift is a right shift by a negative magnitude, and the two forms differ
+     * only in what a right shift feeds in at the top. A right shift clears V.
+     *
+     * What is pushed past the top of the field has to be either nothing at
+     * all, or - for a result that is itself negative - that result's sign
+     * extension. Note the first case stands alone: a positive value shifted
+     * until it reads as negative has still lost no bits, and does not set V.
      */
-    if (arith) {
+    {
+        TCGv_i64 out = tcg_temp_new_i64();
+        TCGv_i64 fill = tcg_temp_new_i64();
+        TCGv_i64 fits = tcg_temp_new_i64();
+        TCGv_i64 neg = tcg_temp_new_i64();
+        TCGv sign = tcg_temp_new_i32();
+
         if (width == 32) {
-            tcg_gen_ext32s_i64(t64, left);
+            tcg_gen_extu_i32_i64(t64, src);
         } else {
-            tcg_gen_ext16s_i64(t64, left);
+            tcg_gen_ext16u_i32(sign, src);
+            tcg_gen_extu_i32_i64(t64, sign);
         }
-        tcg_gen_setcond_i64(TCG_COND_NE, t64, t64, left);
-        tcg_gen_extrl_i64_i32(ovf, t64);
+        tcg_gen_shl_i64(out, t64, sh);
+        tcg_gen_shri_i64(out, out, width);
+
+        tcg_gen_shl_i64(fill, tcg_constant_i64(1), sh);
+        tcg_gen_subi_i64(fill, fill, 1);
+
+        tcg_gen_shri_i32(sign, res, width - 1);
+        tcg_gen_andi_i32(sign, sign, 1);
+        tcg_gen_extu_i32_i64(neg, sign);
+
+        tcg_gen_setcond_i64(TCG_COND_EQ, fits, out, fill);
+        tcg_gen_and_i64(fits, fits, neg);
+        tcg_gen_setcondi_i64(TCG_COND_EQ, neg, out, 0);
+        tcg_gen_or_i64(fits, fits, neg);
+
+        tcg_gen_extrl_i64_i32(ovf, fits);
+        tcg_gen_xori_i32(ovf, ovf, 1);
         tcg_gen_movcond_i32(TCG_COND_GE, ovf, mag, zero, ovf, zero);
-    } else {
-        tcg_gen_movi_i32(ovf, 0);
     }
 
     if (sat) {
