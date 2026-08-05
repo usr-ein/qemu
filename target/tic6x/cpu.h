@@ -109,6 +109,7 @@ enum {
     TIC6X_EXCP_NONE = 0,
     TIC6X_EXCP_UNIMPLEMENTED,   /* an encoding this model does not run    */
     TIC6X_EXCP_ILLEGAL,         /* no encoding matched at all             */
+    TIC6X_EXCP_FETCH_ABORT,     /* fetched from somewhere with no memory  */
     TIC6X_EXCP_INTERRUPT,
 };
 

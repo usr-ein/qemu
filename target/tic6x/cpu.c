@@ -18,6 +18,10 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysemu-cpu-ops.h"
 #include "accel/tcg/cpu-ops.h"
+#include "system/memory.h"
+#include "system/address-spaces.h"
+#include "qemu/log.h"
+#include "qemu/rcu.h"
 
 /*
  * The C674x has no MMU. There is a memory protection unit and caches, but
@@ -69,10 +73,51 @@ static int tic6x_cpu_mmu_index(CPUState *cs, bool ifetch)
     return 0;
 }
 
+/* Is there real memory behind this address, or would a read invent zeros? */
+static bool tic6x_addr_is_ram(CPUState *cs, vaddr addr)
+{
+    AddressSpace *as = cpu_get_address_space(cs, 0);
+    hwaddr xlat, len = 1;
+    MemoryRegion *mr;
+
+    RCU_READ_LOCK_GUARD();
+    mr = address_space_translate(as, addr, &xlat, &len, false,
+                                 MEMTXATTRS_UNSPECIFIED);
+    return mr && (memory_region_is_ram(mr) || memory_region_is_romd(mr));
+}
+
 static bool tic6x_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                                MMUAccessType access_type, int mmu_idx,
                                bool probe, uintptr_t retaddr)
 {
+    /*
+     * Fetching from somewhere with no memory behind it is always a bug, and
+     * without this it is a silent one: an unmapped read returns zero, zero
+     * decodes as NOP, and a core that has jumped somewhere wild walks
+     * forward through the whole address space executing nothing for as long
+     * as it is left running. That happened, and it buried the evidence -
+     * millions of log lines of a runaway doing wild loads, on top of the few
+     * real accesses that mattered. Stopping at the first bad fetch says
+     * where the jump went instead.
+     *
+     * Data accesses are left alone. Peripherals that are not modelled yet
+     * are legitimately not RAM, and they have their own logging.
+     */
+    if (access_type == MMU_INST_FETCH && !tic6x_addr_is_ram(cs, address)) {
+        CPUTIC6XState *env = cpu_env(cs);
+
+        if (probe) {
+            return false;
+        }
+        env->excp_insn = 0;
+        env->excp_mnem = ~0u;
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "tic6x: fetch from 0x%08x, which is not memory\n",
+                      (uint32_t)address);
+        cs->exception_index = TIC6X_EXCP_FETCH_ABORT;
+        cpu_loop_exit_restore(cs, retaddr);
+    }
+
     tlb_set_page(cs, address & TARGET_PAGE_MASK,
                  address & TARGET_PAGE_MASK,
                  PAGE_READ | PAGE_WRITE | PAGE_EXEC,

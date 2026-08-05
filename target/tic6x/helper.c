@@ -144,6 +144,7 @@ void tic6x_cpu_do_interrupt(CPUState *cs)
     switch (cs->exception_index) {
     case TIC6X_EXCP_UNIMPLEMENTED:
     case TIC6X_EXCP_ILLEGAL:
+    case TIC6X_EXCP_FETCH_ABORT:
         /*
          * Stop rather than pretend. A DSP that carries on past an
          * instruction it did not run produces wrong answers quietly, and
