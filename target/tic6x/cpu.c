@@ -47,7 +47,7 @@ static TCGTBCPUState tic6x_get_tb_cpu_state(CPUState *cs)
 {
     CPUTIC6XState *env = cpu_env(cs);
 
-    return (TCGTBCPUState){ .pc = env->pc, .flags = 0 };
+    return (TCGTBCPUState){ .pc = env->pc, .flags = env->br_cnt };
 }
 
 static void tic6x_cpu_synchronize_from_tb(CPUState *cs,
@@ -241,6 +241,7 @@ static const VMStateDescription vmstate_tic6x_cpu = {
         VMSTATE_UINT32_ARRAY(env.cr, ArchCPU, TIC6X_NUM_CR),
         VMSTATE_UINT32(env.br_target, ArchCPU),
         VMSTATE_UINT32(env.br_taken, ArchCPU),
+        VMSTATE_UINT32(env.br_cnt, ArchCPU),
         VMSTATE_END_OF_LIST()
     }
 };

@@ -120,9 +120,21 @@ typedef struct CPUArchState {
 
     uint32_t cr[TIC6X_NUM_CR];
 
-    /* One branch in flight; see TIC6X_BRANCH_DELAY above. */
+    /*
+     * One branch in flight; see TIC6X_BRANCH_DELAY above.
+     *
+     * br_cnt is how many cycles are left before it lands, or zero for none,
+     * and it has to live here rather than in the translator's context: a
+     * translation block can end anywhere, including inside the delay slots,
+     * and a countdown that only exists while a block is being built is
+     * simply lost when one does. The branch then never happens and execution
+     * walks on through whatever follows. It is also part of the block's
+     * lookup key, because the same address means different things with a
+     * branch pending and without.
+     */
     uint32_t br_target;
     uint32_t br_taken;
+    uint32_t br_cnt;
 
     /*
      * What the translator could not run, kept so the exception handler can

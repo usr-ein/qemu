@@ -59,6 +59,7 @@ static TCGv_i32 cpu_gpr[TIC6X_NUM_GPR];
 static TCGv_i32 cpu_pc;
 static TCGv_i32 cpu_br_target;
 static TCGv_i32 cpu_br_taken;
+static TCGv_i32 cpu_br_cnt;
 
 #define TIC6X_MAX_WB 8
 
@@ -97,6 +98,10 @@ typedef struct DisasContext {
      * cycles rather than packets because NOP n occupies n of them.
      */
     int br_countdown;
+
+    /* A branch scheduled by the packet being translated right now does not
+       consume one of its own delay slots. */
+    bool br_just_set;
 } DisasContext;
 
 static void wb_add(DisasContext *dc, int reg, TCGv_i32 val)
@@ -1270,6 +1275,7 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
             wb_pred(dc, pred, src, dec);
         }
         dc->br_countdown = TIC6X_BRANCH_DELAY;
+        dc->br_just_set = true;
         break;
     }
 
@@ -1289,6 +1295,7 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
         tcg_gen_movi_i32(cpu_br_target, dc->pce1 + (disp << 2));
         tcg_gen_movi_i32(cpu_br_taken, 1);
         dc->br_countdown = 0;       /* lands at the end of this packet */
+        dc->br_just_set = false;
         break;
     }
 
@@ -1360,6 +1367,7 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
                           dc->packet_pc);
         }
         dc->br_countdown = TIC6X_BRANCH_DELAY;
+        dc->br_just_set = true;
         /*
          * BNOP is a branch with its own nop count, which fills some of the
          * delay slots the branch just opened. The count has to be honoured
@@ -1452,12 +1460,31 @@ static int translate_packet(CPUState *cs, DisasContext *dc, uint32_t pc,
             uint32_t layout = (header >> 21) & 0x7f;
             uint32_t expansion = (header >> 14) & 0x7f;
             uint32_t pbits = header & 0x3fff;
-            int i, bit = 0;
+            int i;
 
-            /* Count the p-bit slots that precede the first word taken. */
-            for (i = 0; i < slot; i++) {
-                bit += (layout & (1u << i)) ? 2 : 1;
-            }
+            /*
+             * Where each instruction's p-bit lives, which is not what it
+             * looks like and was wrong here in two ways at once.
+             *
+             * The header's fourteen p-bits are indexed by WORD POSITION, two
+             * per word - table 3-16 spells them out as "word N, least
+             * significant sixteen bits" and "word N, most significant" - so
+             * word i uses bits 2i and 2i+1. Walking a running counter that
+             * advances by one for a 32-bit word and two for a compact one
+             * gives the same answer only while every preceding word is
+             * compact, and a different one as soon as a 32-bit word comes
+             * first.
+             *
+             * And a 32-bit instruction inside a header-based packet keeps
+             * its own p-bit in bit 0 of the opcode. The header's p-bits are
+             * there for compact instructions, which have no room for one;
+             * they do not displace the bit a full-width instruction already
+             * carries. tic6x-dis.c is explicit about it - for a non-compact
+             * previous word it reads prev_opcode & 1 rather than the header.
+             *
+             * Getting either of these wrong moves the end of the execute
+             * packet, which moves where execution resumes.
+             */
             for (i = slot; i < 7 && !ended; i++) {
                 uint32_t w = word[i];
                 bool compact = layout & (1u << i);
@@ -1465,24 +1492,26 @@ static int translate_packet(CPUState *cs, DisasContext *dc, uint32_t pc,
                 int h;
 
                 for (h = 0; h < halves; h++) {
+                    bool parallel;
                     int c;
 
                     if (compact) {
                         uint32_t op16 = h ? (w >> 16) : (w & 0xffff);
 
                         c = trans_one(dc, op16, 16, expansion);
+                        parallel = pbits & (1u << (2 * i + h));
                     } else {
                         c = trans_one(dc, w, 32, 0);
+                        parallel = w & 1;
                     }
                     if (c > *cycles) {
                         *cycles = c;
                     }
-                    if (!(pbits & (1u << bit))) {
+                    if (!parallel) {
                         consumed += (i - slot) * 4 + 4;
                         ended = true;
                         break;
                     }
-                    bit++;
                 }
             }
             if (!ended) {
@@ -1522,7 +1551,13 @@ static void tic6x_tr_init_disas_context(DisasContextBase *dcbase,
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
 
-    dc->br_countdown = -1;
+    /*
+     * Pick the countdown up from where the last block left it. Zero means
+     * nothing is in flight; otherwise this block starts part way through
+     * some earlier branch's delay slots.
+     */
+    dc->br_countdown = dc->base.tb->flags ? (int)dc->base.tb->flags : -1;
+    dc->br_just_set = false;
     dc->nwb = 0;
 }
 
@@ -1547,7 +1582,15 @@ static void tic6x_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     dc->base.pc_next = pc + len;
 
     if (dc->br_countdown >= 0) {
-        dc->br_countdown -= cycles;
+        if (dc->br_just_set) {
+            /* The branch's own packet is not one of its delay slots. */
+            dc->br_just_set = false;
+        } else {
+            dc->br_countdown -= cycles;
+        }
+        /* Keep env in step, so a block ending here does not lose it. */
+        tcg_gen_movi_i32(cpu_br_cnt, dc->br_countdown > 0
+                                     ? dc->br_countdown : 0);
         if (dc->br_countdown <= 0) {
             /*
              * The delay slots are done. If the branch was taken, go to its
@@ -1560,6 +1603,7 @@ static void tic6x_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
             tcg_gen_mov_i32(cpu_pc, cpu_br_target);
             tcg_gen_exit_tb(NULL, 0);
             gen_set_label(not_taken);
+            tcg_gen_movi_i32(cpu_br_cnt, 0);
             dc->br_countdown = -1;
             dc->base.is_jmp = DISAS_TOO_MANY;
         }
@@ -1618,4 +1662,7 @@ void tic6x_translate_init(void)
     cpu_br_taken = tcg_global_mem_new_i32(tcg_env,
                                           offsetof(CPUTIC6XState, br_taken),
                                           "br_taken");
+    cpu_br_cnt = tcg_global_mem_new_i32(tcg_env,
+                                        offsetof(CPUTIC6XState, br_cnt),
+                                        "br_cnt");
 }
