@@ -1390,99 +1390,127 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
  * bits 31-28 set to 1110 it is a header rather than an instruction, and the
  * other seven words hold a mixture of 32-bit opcodes and pairs of 16-bit
  * compact ones, with the p-bits in the header instead of in the opcodes.
- * Compact instructions are about 5% of this firmware, so they are decoded
- * far enough to keep the packet walk in step and then trap by name.
+ *
+ * AN EXECUTE PACKET CAN CROSS A FETCH PACKET BOUNDARY - SPRUFE8B 3.5 says so
+ * plainly - and this has to follow it when it does, because the writeback
+ * list is what makes the instructions in a packet independent and it is only
+ * correct if it is flushed once, at the true end. Stopping at the fetch
+ * packet boundary and letting the translator loop start a "new" packet for
+ * the remainder flushes it in the middle, so the second half sees results
+ * from the first half that the hardware would not have written yet. That is
+ * silent whenever the two halves touch different registers and wrong the
+ * moment they do not.
+ *
+ * An execute packet is at most eight instructions, so it can span at most
+ * two fetch packets; going further means the walk has lost its place.
  */
 static int translate_packet(CPUState *cs, DisasContext *dc, uint32_t pc,
                             int *cycles)
 {
     uint32_t fp_base = pc & ~31u;
-    uint32_t word[8];
-    uint32_t header;
-    bool have_header;
-    int slot = (pc - fp_base) / 4;
     int consumed = 0;
-    int n;
+    int fetch_packets = 0;
+    bool ended = false;
 
     dc->packet_pc = pc;
     dc->pce1 = fp_base;
     dc->nwb = 0;
     *cycles = 1;
 
-    /*
-     * Read the rest of the fetch packet up front, in address order.
-     *
-     * The translator records the bytes a block was built from and asserts
-     * they are read contiguously and forwards, so the header - which is the
-     * LAST word of the packet - cannot be peeked at before the instructions
-     * that precede it. Reading the tail into an array first satisfies that
-     * and costs nothing: a fetch packet is 32 bytes on a 32-byte boundary,
-     * so it never straddles a page and reading to its end can never fault
-     * somewhere the instructions themselves would not have.
-     */
-    for (n = slot; n < 8; n++) {
-        word[n] = translator_ldl_end(cpu_env(cs), &dc->base,
-                                     fp_base + n * 4, MO_LE);
-    }
+    while (!ended) {
+        uint32_t word[8];
+        uint32_t header;
+        bool have_header;
+        int slot = fetch_packets ? 0 : (pc - fp_base) / 4;
+        int n;
 
-    header = word[7];
-    have_header = (header >> 28) == 0xE;
-
-    if (have_header) {
-        uint32_t layout = (header >> 21) & 0x7f;
-        uint32_t expansion = (header >> 14) & 0x7f;
-        uint32_t pbits = header & 0x3fff;
-        int i, bit = 0;
-
-        /* Count the p-bit slots that precede this word. */
-        for (i = 0; i < slot; i++) {
-            bit += (layout & (1u << i)) ? 2 : 1;
+        if (++fetch_packets > 2) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "tic6x: execute packet at 0x%08x spans more than "
+                          "two fetch packets\n", dc->packet_pc);
+            break;
         }
-        for (i = slot; i < 7; i++) {
-            uint32_t w = word[i];
-            bool compact = layout & (1u << i);
-            int halves = compact ? 2 : 1;
-            int h;
 
-            for (h = 0; h < halves; h++) {
-                int c;
+        /*
+         * Read this fetch packet's remaining words up front, in address
+         * order. The translator records the bytes a block was built from and
+         * asserts they are read contiguously and forwards, so the header -
+         * which is the LAST word - cannot be peeked at before the
+         * instructions preceding it. Reading the tail into an array first
+         * satisfies that, and a fetch packet is 32 bytes on a 32-byte
+         * boundary so it never straddles a page.
+         */
+        for (n = slot; n < 8; n++) {
+            word[n] = translator_ldl_end(cpu_env(cs), &dc->base,
+                                         fp_base + n * 4, MO_LE);
+        }
 
-                if (compact) {
-                    uint32_t op16 = h ? (w >> 16) : (w & 0xffff);
+        header = word[7];
+        have_header = (header >> 28) == 0xE;
 
-                    c = trans_one(dc, op16, 16, expansion);
-                } else {
-                    c = trans_one(dc, w, 32, 0);
+        if (have_header) {
+            uint32_t layout = (header >> 21) & 0x7f;
+            uint32_t expansion = (header >> 14) & 0x7f;
+            uint32_t pbits = header & 0x3fff;
+            int i, bit = 0;
+
+            /* Count the p-bit slots that precede the first word taken. */
+            for (i = 0; i < slot; i++) {
+                bit += (layout & (1u << i)) ? 2 : 1;
+            }
+            for (i = slot; i < 7 && !ended; i++) {
+                uint32_t w = word[i];
+                bool compact = layout & (1u << i);
+                int halves = compact ? 2 : 1;
+                int h;
+
+                for (h = 0; h < halves; h++) {
+                    int c;
+
+                    if (compact) {
+                        uint32_t op16 = h ? (w >> 16) : (w & 0xffff);
+
+                        c = trans_one(dc, op16, 16, expansion);
+                    } else {
+                        c = trans_one(dc, w, 32, 0);
+                    }
+                    if (c > *cycles) {
+                        *cycles = c;
+                    }
+                    if (!(pbits & (1u << bit))) {
+                        consumed += (i - slot) * 4 + 4;
+                        ended = true;
+                        break;
+                    }
+                    bit++;
                 }
+            }
+            if (!ended) {
+                /* Ran out of instructions here; the header is not one. */
+                consumed += (7 - slot) * 4 + 4;
+            }
+        } else {
+            for (n = slot; n < 8; n++) {
+                uint32_t w = word[n];
+                int c = trans_one(dc, w, 32, 0);
+
                 if (c > *cycles) {
                     *cycles = c;
                 }
-                if (!(pbits & (1u << bit))) {
-                    /* p-bit clear: the execute packet ends here. */
-                    consumed = (i - slot) * 4 + 4;
-                    goto done;
+                if (!(w & 1)) {
+                    consumed += (n - slot) * 4 + 4;
+                    ended = true;
+                    break;
                 }
-                bit++;
+            }
+            if (!ended) {
+                consumed += (8 - slot) * 4;
             }
         }
-        consumed = (7 - slot) * 4;
-    } else {
-        for (n = slot; n < 8; n++) {
-            uint32_t w = word[n];
-            int c = trans_one(dc, w, 32, 0);
 
-            if (c > *cycles) {
-                *cycles = c;
-            }
-            if (!(w & 1)) {
-                consumed = (n - slot) * 4 + 4;
-                goto done;
-            }
-        }
-        consumed = (8 - slot) * 4;
+        /* Carry on into the next fetch packet if the packet did not end. */
+        fp_base += 32;
     }
-
-done:
     wb_flush(dc);
     return consumed ? consumed : 4;
 }
