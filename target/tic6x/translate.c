@@ -213,6 +213,38 @@ static int reg_of(uint32_t side, uint32_t num)
     return (side ? 32 : 0) + (num & 31);
 }
 
+/*
+ * src1 as a value. It holds either a register number or a small constant
+ * depending on the encoding, and the two forms share a format - ADD .L1
+ * A3,A4,A5 and ADD .L1 5,A4,A5 differ only in the op field and in how src1
+ * is read. The generated table carries that from binutils' ENC lists, which
+ * is the only place it is written down; without it the constant forms
+ * quietly compute with a register number as though it were a value.
+ */
+static TCGv_i32 src1_value(const TIC6XFormat *f, const TIC6XOpcode *op,
+                           uint32_t insn, uint32_t s)
+{
+    uint32_t raw = field_get(f, TIC6X_FLD_src1, insn);
+    TCGv_i32 v = tcg_temp_new_i32();
+
+    switch (op->enc[TIC6X_FLD_src1]) {
+    case TIC6X_ENC_SCST:
+        /* Five bits signed, in every form the .L and .S units use. */
+        tcg_gen_movi_i32(v, (int32_t)(raw << 27) >> 27);
+        break;
+    case TIC6X_ENC_UCST:
+        tcg_gen_movi_i32(v, raw);
+        break;
+    case TIC6X_ENC_SCST_NEG:
+        tcg_gen_movi_i32(v, -(int32_t)((int32_t)(raw << 27) >> 27));
+        break;
+    default:
+        tcg_gen_mov_i32(v, cpu_gpr[reg_of(s, raw)]);
+        break;
+    }
+    return v;
+}
+
 /* The addressing modes of the .D unit load and store, SPRUFE8B 3.8. */
 static TCGv_i32 addr_mode(DisasContext *dc, TCGv_i32 pred,
                           const TIC6XFormat *f, uint32_t insn, int scale)
@@ -382,22 +414,8 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
          */
         int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
         int src2 = reg_of(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
-        uint32_t src1 = field_get(f, TIC6X_FLD_src1, insn);
-        TCGv_i32 a = tcg_temp_new_i32();
+        TCGv_i32 a = src1_value(f, op, insn, s);
         TCGv_i32 v = tcg_temp_new_i32();
-
-        /*
-         * Whether src1 is a register or a constant is not something this
-         * first cut can tell from the table alone: the operand list that
-         * says so is not carried into the generated tables yet. Registers
-         * are the common case and the constant forms trap, rather than
-         * silently computing with a register number as if it were a value.
-         */
-        if (op->nfix && op->fix[0].field == TIC6X_FLD_op) {
-            tcg_gen_mov_i32(a, cpu_gpr[reg_of(s, src1)]);
-        } else {
-            tcg_gen_mov_i32(a, cpu_gpr[reg_of(s, src1)]);
-        }
 
         switch (op->mnem) {
         case TIC6X_MNEM_add:
@@ -463,6 +481,134 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
         TCGv_i32 addr = addr_mode(dc, pred, f, insn, scale);
 
         gen_store(dc, pred, src, addr, mo);
+        break;
+    }
+
+    case TIC6X_MNEM_cmpeq:
+    case TIC6X_MNEM_cmpgt:
+    case TIC6X_MNEM_cmpgtu:
+    case TIC6X_MNEM_cmplt:
+    case TIC6X_MNEM_cmpltu: {
+        /* dst is 1 or 0, which is what the predicate registers then test. */
+        int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
+        int src2 = reg_of(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 a = src1_value(f, op, insn, s);
+        TCGv_i32 v = tcg_temp_new_i32();
+        TCGCond c;
+
+        switch (op->mnem) {
+        case TIC6X_MNEM_cmpeq:  c = TCG_COND_EQ;  break;
+        case TIC6X_MNEM_cmpgt:  c = TCG_COND_LT;  break;
+        case TIC6X_MNEM_cmpgtu: c = TCG_COND_LTU; break;
+        case TIC6X_MNEM_cmplt:  c = TCG_COND_GT;  break;
+        default:                c = TCG_COND_GTU; break;
+        }
+        /*
+         * The operand order is src2 op src1 - CMPGT .L1 A3,A4,A5 sets A5
+         * when A3 > A4, and src1 is the first written operand - so the
+         * comparison is inverted relative to the register order here.
+         */
+        tcg_gen_setcond_i32(c, v, cpu_gpr[src2], a);
+        wb_pred(dc, pred, dst, v);
+        break;
+    }
+
+    case TIC6X_MNEM_extu:
+    case TIC6X_MNEM_ext: {
+        /*
+         * Shift left by csta, then right by cstb, arithmetic for ext and
+         * logical for extu. That is how the C6000 spells a bit-field
+         * extract, and the two constants come as one ten-bit src1 in the
+         * constant form.
+         */
+        int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
+        int src2 = reg_of(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 v = tcg_temp_new_i32();
+
+        if (field_present(f, TIC6X_FLD_csta)) {
+            uint32_t csta = field_get(f, TIC6X_FLD_csta, insn);
+            uint32_t cstb = field_get(f, TIC6X_FLD_cstb, insn);
+
+            tcg_gen_shli_i32(v, cpu_gpr[src2], csta);
+            if (op->mnem == TIC6X_MNEM_ext) {
+                tcg_gen_sari_i32(v, v, cstb);
+            } else {
+                tcg_gen_shri_i32(v, v, cstb);
+            }
+        } else {
+            /* Register form: src1 holds csta in 9:5 and cstb in 4:0. */
+            TCGv_i32 amt = cpu_gpr[reg_of(s, field_get(f, TIC6X_FLD_src1,
+                                                       insn))];
+            TCGv_i32 sa = tcg_temp_new_i32();
+            TCGv_i32 sb = tcg_temp_new_i32();
+
+            tcg_gen_extract_i32(sa, amt, 5, 5);
+            tcg_gen_extract_i32(sb, amt, 0, 5);
+            tcg_gen_shl_i32(v, cpu_gpr[src2], sa);
+            if (op->mnem == TIC6X_MNEM_ext) {
+                tcg_gen_sar_i32(v, v, sb);
+            } else {
+                tcg_gen_shr_i32(v, v, sb);
+            }
+        }
+        wb_pred(dc, pred, dst, v);
+        break;
+    }
+
+    case TIC6X_MNEM_clr:
+    case TIC6X_MNEM_set: {
+        /* Clear or set the bits from csta to cstb inclusive. */
+        int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
+        int src2 = reg_of(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 v = tcg_temp_new_i32();
+
+        if (field_present(f, TIC6X_FLD_csta)) {
+            uint32_t csta = field_get(f, TIC6X_FLD_csta, insn);
+            uint32_t cstb = field_get(f, TIC6X_FLD_cstb, insn);
+            uint32_t width = cstb >= csta ? cstb - csta + 1 : 0;
+            uint32_t mask = width >= 32 ? 0xffffffffu
+                                        : (((1u << width) - 1) << csta);
+
+            if (op->mnem == TIC6X_MNEM_set) {
+                tcg_gen_ori_i32(v, cpu_gpr[src2], mask);
+            } else {
+                tcg_gen_andi_i32(v, cpu_gpr[src2], ~mask);
+            }
+            wb_pred(dc, pred, dst, v);
+        } else {
+            gen_helper_unimplemented(tcg_env, tcg_constant_i32(insn),
+                                     tcg_constant_i32(op->mnem));
+        }
+        break;
+    }
+
+    case TIC6X_MNEM_shl:
+    case TIC6X_MNEM_shr:
+    case TIC6X_MNEM_shru: {
+        /*
+         * The shift count is src1 and the value src2, which is the reverse
+         * of the usual reading of the operand order.
+         */
+        int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
+        int src2 = reg_of(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 amt = src1_value(f, op, insn, s);
+        TCGv_i32 v = tcg_temp_new_i32();
+        TCGv_i32 cap = tcg_temp_new_i32();
+
+        /* A count above 31 saturates the result rather than wrapping. */
+        tcg_gen_umin_i32(cap, amt, tcg_constant_i32(31));
+        switch (op->mnem) {
+        case TIC6X_MNEM_shl:
+            tcg_gen_shl_i32(v, cpu_gpr[src2], cap);
+            break;
+        case TIC6X_MNEM_shr:
+            tcg_gen_sar_i32(v, cpu_gpr[src2], cap);
+            break;
+        default:
+            tcg_gen_shr_i32(v, cpu_gpr[src2], cap);
+            break;
+        }
+        wb_pred(dc, pred, dst, v);
         break;
     }
 
