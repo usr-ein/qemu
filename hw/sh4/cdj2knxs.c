@@ -38,6 +38,7 @@
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "system/reset.h"
+#include "qemu/log.h"
 #include "target/sh4/cpu.h"
 
 /*
@@ -47,6 +48,144 @@
  * probe. It also DMAs blocks to a fixed 0x0c080000, presumably a mailbox for
  * the separate GUI processor, but that lands in the same memory.
  */
+
+/*
+ * The MAIN DSP, IC301 (D810K013CZKB400), through its host port.
+ *
+ * Schematic sheet 10.5 shows the part with three blocks - EMIFA labelled
+ * "U-HPI", EMIF-B, and power - and it is the U-HPI that faces the main
+ * processor: sixteen data lines CPU_DATA0D to CPU_DATA15D, address lines into
+ * UHPI_HCNTL0, UHPI_HCNTL1, UHPI_HAS and UHPI_HHWIL, UHPI_HCS off
+ * CPU_DSP_ENABLE, and UHPI_HRDY coming back as DSP_RDY. That is a Texas
+ * Instruments style host port, four registers selected by HCNTL.
+ *
+ * The SH7764 only has two normal-space areas, CS0 and CS3, and CS0 is the
+ * flash, so the DSP is in area 3. Which four addresses it answers on was
+ * measured rather than read off the schematic - a logging overlay on area 3
+ * showed the firmware touching exactly four, a quarter of a megabyte apart,
+ * so HCNTL is wired to address bits 19 and 18:
+ *
+ *     0x0C000000   34 reads, 2 writes of 0x4 and 0x00010001   HPIC
+ *     0x0C040000   one write of 0x11801DA0                    HPIA
+ *     0x0C080000   3997 writes                                HPID, download
+ *     0x0C0C0000   3966 reads                                 HPID, verify
+ *
+ * The 0x00010001 is HPIC's giveaway: the register is sixteen bits mirrored
+ * into both halves of the word. The rest is a program download - set the
+ * address once, write the image, then read it back and check it. Backed by
+ * plain RAM the readback returned zeroes, the check failed, and the firmware
+ * declared the DSP dead: "Downloading of programs is not possible" in section
+ * [12-2] of the service manual, E-7010 on the screen.
+ *
+ * This models the port, not the DSP: an address register, a data port that
+ * auto-increments it, and memory behind them, so a download reads back as
+ * what was written. Nothing executes it. That is enough to satisfy the check
+ * and is honest about being a stub - a player emulated this way will not make
+ * a sound, which for the purpose here is fine.
+ */
+#define CDJ2KNXS_DSP_BASE       0x0c000000
+#define CDJ2KNXS_DSP_WINDOW     0x00100000
+#define CDJ2KNXS_DSP_STRIDE     0x00040000
+#define CDJ2KNXS_DSP_MEM        (16 * MiB)
+
+/*
+ * HPIC, as the C6000 host port defines it. The host sets DSPINT to interrupt
+ * the DSP; a running DSP takes the interrupt, which clears DSPINT, and
+ * answers by raising HINT, which the host clears by writing a one back. A
+ * stub that only stores the bits never answers, and the firmware is left
+ * waiting for a DSP that appears not to be running.
+ */
+#define CDJ2KNXS_HPIC_HWOB      0x0001
+#define CDJ2KNXS_HPIC_DSPINT    0x0002      /* host to DSP, DSP clears it   */
+#define CDJ2KNXS_HPIC_HINT      0x0004      /* DSP to host, host clears it  */
+#define CDJ2KNXS_HPIC_HRDY      0x0008      /* the port is ready for a word */
+
+typedef struct CDJ2KNXSDSP {
+    MemoryRegion iomem;
+    uint32_t hpic;
+    uint32_t hpia;
+    uint32_t words;
+    uint8_t *mem;
+} CDJ2KNXSDSP;
+
+static uint64_t cdj2knxs_dsp_read(void *opaque, hwaddr off, unsigned size)
+{
+    CDJ2KNXSDSP *s = opaque;
+    uint32_t v = 0;
+
+    switch (off / CDJ2KNXS_DSP_STRIDE) {
+    case 0:                             /* HPIC, mirrored, always ready */
+        v = (s->hpic | CDJ2KNXS_HPIC_HRDY) & 0xffff;
+        if (getenv("CDJ_DSP_TRACE")) {
+            qemu_log("dsp: read HPIC = 0x%08x\n", v | (v << 16));
+        }
+        return v | (v << 16);
+    case 1:
+        return s->hpia;
+    default:                            /* HPID, either window */
+        memcpy(&v, s->mem + (s->hpia & (CDJ2KNXS_DSP_MEM - 1)), 4);
+        s->hpia += 4;
+        s->words++;
+        return v;
+    }
+}
+
+static void cdj2knxs_dsp_write(void *opaque, hwaddr off, uint64_t value,
+                               unsigned size)
+{
+    CDJ2KNXSDSP *s = opaque;
+    uint32_t v = value;
+
+    switch (off / CDJ2KNXS_DSP_STRIDE) {
+    case 0:
+        if (getenv("CDJ_DSP_TRACE")) {
+            qemu_log("dsp: write HPIC = 0x%08x\n", v);
+        }
+        s->hpic = (s->hpic & ~CDJ2KNXS_HPIC_HWOB) | (v & CDJ2KNXS_HPIC_HWOB);
+        if (v & CDJ2KNXS_HPIC_HINT) {
+            s->hpic &= ~CDJ2KNXS_HPIC_HINT;     /* host acknowledges */
+        }
+        if (v & CDJ2KNXS_HPIC_DSPINT) {
+            /* Taken and answered at once: nothing here runs the DSP. */
+            s->hpic &= ~CDJ2KNXS_HPIC_DSPINT;
+            s->hpic |= CDJ2KNXS_HPIC_HINT;
+        }
+        return;
+    case 1:
+        if (getenv("CDJ_DSP_TRACE")) {
+            qemu_log("dsp: write HPIA = 0x%08x (after %u data words)\n",
+                     v, s->words);
+            s->words = 0;
+        }
+        s->hpia = v;
+        return;
+    default:
+        memcpy(s->mem + (s->hpia & (CDJ2KNXS_DSP_MEM - 1)), &v, 4);
+        s->hpia += 4;
+        s->words++;
+        return;
+    }
+}
+
+static const MemoryRegionOps cdj2knxs_dsp_ops = {
+    .read = cdj2knxs_dsp_read,
+    .write = cdj2knxs_dsp_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
+static void cdj2knxs_dsp_init(MemoryRegion *sysmem)
+{
+    CDJ2KNXSDSP *s = g_new0(CDJ2KNXSDSP, 1);
+
+    s->mem = g_malloc0(CDJ2KNXS_DSP_MEM);
+    memory_region_init_io(&s->iomem, NULL, &cdj2knxs_dsp_ops, s,
+                          "cdj2knxs.dsp-hpi", CDJ2KNXS_DSP_WINDOW);
+    memory_region_add_subregion_overlap(sysmem, CDJ2KNXS_DSP_BASE,
+                                        &s->iomem, 1);
+}
+
 #define CDJ2KNXS_EXTBUS_BASE    0x0c000000
 #define CDJ2KNXS_EXTBUS_SIZE    (64 * MiB)
 
@@ -121,6 +260,7 @@ static void cdj2knxs_init(MachineState *machine)
     memory_region_init_ram(area3, NULL, "cdj2knxs.area3",
                            CDJ2KNXS_EXTBUS_SIZE, &error_fatal);
     memory_region_add_subregion(sysmem, CDJ2KNXS_EXTBUS_BASE, area3);
+    cdj2knxs_dsp_init(sysmem);
 
     soc = qdev_new(TYPE_SH7764);
     object_property_set_link(OBJECT(soc), "cpu", OBJECT(cpu), &error_fatal);
