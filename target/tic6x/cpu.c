@@ -47,7 +47,7 @@ static TCGTBCPUState tic6x_get_tb_cpu_state(CPUState *cs)
 {
     CPUTIC6XState *env = cpu_env(cs);
 
-    return (TCGTBCPUState){ .pc = env->pc, .flags = env->br_cnt };
+    return (TCGTBCPUState){ .pc = env->pc, .flags = env->br_pend };
 }
 
 static void tic6x_cpu_synchronize_from_tb(CPUState *cs,
@@ -203,10 +203,16 @@ void tic6x_cpu_dump_state(CPUState *cs, FILE *f, int flags)
     qemu_fprintf(f, "PC  %08x  CSR %08x  IER %08x  IFR %08x  ISTP %08x\n",
                  env->pc, env->cr[TIC6X_CR_CSR], env->cr[TIC6X_CR_IER],
                  env->cr[TIC6X_CR_IFR], env->cr[TIC6X_CR_ISTP]);
-    qemu_fprintf(f, "IRP %08x  NRP %08x  AMR %08x  branch %s -> %08x\n",
+    qemu_fprintf(f, "IRP %08x  NRP %08x  AMR %08x  branches in flight %02x\n",
                  env->cr[TIC6X_CR_IRP], env->cr[TIC6X_CR_NRP],
-                 env->cr[TIC6X_CR_AMR],
-                 env->br_taken ? "pending" : "idle", env->br_target);
+                 env->cr[TIC6X_CR_AMR], env->br_pend);
+    for (i = 1; i < TIC6X_BR_SLOTS; i++) {
+        if (env->br_pend & (1u << i)) {
+            qemu_fprintf(f, "    in %d cycle%s -> %08x%s\n", i,
+                         i == 1 ? "" : "s", env->br_target[i],
+                         env->br_taken[i] ? "" : "  (predicated off)");
+        }
+    }
     for (i = 0; i < 32; i++) {
         qemu_fprintf(f, "A%-2d %08x%s", i, env->gpr[TIC6X_REG_A(i)],
                      (i % 4) == 3 ? "\n" : "  ");
@@ -239,9 +245,9 @@ static const VMStateDescription vmstate_tic6x_cpu = {
         VMSTATE_UINT32_ARRAY(env.gpr, ArchCPU, TIC6X_NUM_GPR),
         VMSTATE_UINT32(env.pc, ArchCPU),
         VMSTATE_UINT32_ARRAY(env.cr, ArchCPU, TIC6X_NUM_CR),
-        VMSTATE_UINT32(env.br_target, ArchCPU),
-        VMSTATE_UINT32(env.br_taken, ArchCPU),
-        VMSTATE_UINT32(env.br_cnt, ArchCPU),
+        VMSTATE_UINT32_ARRAY(env.br_target, ArchCPU, TIC6X_BR_SLOTS),
+        VMSTATE_UINT32_ARRAY(env.br_taken, ArchCPU, TIC6X_BR_SLOTS),
+        VMSTATE_UINT32(env.br_pend, ArchCPU),
         VMSTATE_END_OF_LIST()
     }
 };

@@ -97,13 +97,21 @@ FIELD(CSR, CPU_ID, 24, 8)
  * compiler fills them with real work, so this is not a detail that can be
  * rounded off - it is the normal way C6000 code is scheduled.
  *
- * The translator handles the common case by carrying on through the delay
- * slots and emitting the jump when it reaches the landing packet, which
- * keeps blocks whole. What it cannot know at translation time is whether a
- * predicated branch actually executed, so the branch writes its target and
- * a taken flag here and the landing site reads them back.
+ * MORE THAN ONE CAN BE IN FLIGHT. Those five delay slots are ordinary
+ * packets and may contain branches of their own; compiled code does it
+ * constantly. So the state is a set of slots rather than one target, held
+ * by how many cycles are left before each lands - slot k is a branch that
+ * lands k cycles from the end of the current packet, and a branch enters at
+ * slot 5 and works down. Nothing can be pending at slot 0, so the array
+ * wastes an entry to keep the arithmetic readable.
+ *
+ * The translator carries on through the delay slots and emits each jump
+ * when it reaches the landing packet, which keeps blocks whole. What it
+ * cannot know at translation time is whether a predicated branch actually
+ * executed, so each slot carries a taken flag the landing site reads back.
  */
 #define TIC6X_BRANCH_DELAY 5
+#define TIC6X_BR_SLOTS (TIC6X_BRANCH_DELAY + 1)
 
 enum {
     TIC6X_EXCP_NONE = 0,
@@ -132,20 +140,20 @@ typedef struct CPUArchState {
     uint32_t cr[TIC6X_NUM_CR];
 
     /*
-     * One branch in flight; see TIC6X_BRANCH_DELAY above.
+     * The branches in flight; see TIC6X_BRANCH_DELAY above. br_pend is a
+     * bitmask of which slots hold one.
      *
-     * br_cnt is how many cycles are left before it lands, or zero for none,
-     * and it has to live here rather than in the translator's context: a
+     * This has to live here rather than in the translator's context: a
      * translation block can end anywhere, including inside the delay slots,
-     * and a countdown that only exists while a block is being built is
-     * simply lost when one does. The branch then never happens and execution
-     * walks on through whatever follows. It is also part of the block's
+     * and state that only exists while a block is being built is simply
+     * lost when one does. The branch then never happens and execution walks
+     * on through whatever follows. br_pend is also part of the block's
      * lookup key, because the same address means different things with a
      * branch pending and without.
      */
-    uint32_t br_target;
-    uint32_t br_taken;
-    uint32_t br_cnt;
+    uint32_t br_target[TIC6X_BR_SLOTS];
+    uint32_t br_taken[TIC6X_BR_SLOTS];
+    uint32_t br_pend;
 
     /*
      * What the translator could not run, kept so the exception handler can

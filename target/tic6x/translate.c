@@ -61,9 +61,9 @@ const char *tic6x_mnemonic_name(unsigned int mnem)
 
 static TCGv_i32 cpu_gpr[TIC6X_NUM_GPR];
 static TCGv_i32 cpu_pc;
-static TCGv_i32 cpu_br_target;
-static TCGv_i32 cpu_br_taken;
-static TCGv_i32 cpu_br_cnt;
+static TCGv_i32 cpu_br_target[TIC6X_BR_SLOTS];
+static TCGv_i32 cpu_br_taken[TIC6X_BR_SLOTS];
+static TCGv_i32 cpu_br_pend;
 
 /*
  * Results landing in one cycle. Eight functional units is the architectural
@@ -166,14 +166,24 @@ typedef struct DisasContext {
     int nwb;
 
     /*
-     * Packets until a pending branch lands, or -1 for none. The count is in
-     * cycles rather than packets because NOP n occupies n of them.
+     * Which slots hold a branch in flight, tracked statically so the common
+     * case - nothing pending - costs nothing. Slot k lands k cycles from
+     * the end of the current packet; the count is in cycles rather than
+     * packets because NOP n occupies n of them.
      */
-    int br_countdown;
+    uint32_t br_pend;
 
-    /* A branch scheduled by the packet being translated right now does not
-       consume one of its own delay slots. */
-    bool br_just_set;
+    /*
+     * A branch issued by the packet being translated right now. Where it
+     * goes cannot be decided until the packet is finished, because its slot
+     * depends on how many cycles the packet turns out to take: a branch's
+     * own cycle is not one of its delay slots, but the nop cycles a BNOP
+     * carries in the same packet are.
+     */
+    bool br_new;
+    bool br_new_now;            /* CALLP: no delay slots at all */
+    TCGv_i32 br_new_target;
+    TCGv_i32 br_new_taken;
 
     /*
      * The address of the instruction being translated, as opposed to the
@@ -233,6 +243,31 @@ static void wb_flush(DisasContext *dc)
         tcg_gen_mov_i32(cpu_gpr[dc->wb[i].reg], dc->wb[i].val);
     }
     dc->nwb = 0;
+}
+
+/*
+ * Record a branch issued by the packet being translated. Which slot it
+ * lands in is not known yet - that depends on how many cycles the packet
+ * turns out to take - so it is held here and placed once the packet is
+ * done. immediate is CALLP, which has no visible delay slots.
+ */
+static void br_issue(DisasContext *dc, TCGv_i32 target, TCGv_i32 taken,
+                     bool immediate)
+{
+    if (dc->br_new) {
+        /*
+         * Two branches in one execute packet, on .S1 and .S2. They would
+         * land in the same cycle and the architecture does not say which
+         * wins; nothing in this firmware does it.
+         */
+        qemu_log_mask(LOG_UNIMP,
+                      "tic6x: two branches in the execute packet at 0x%08x; "
+                      "the second is the one that lands\n", dc->packet_pc);
+    }
+    dc->br_new = true;
+    dc->br_new_now = immediate;
+    dc->br_new_target = target;
+    dc->br_new_taken = taken;
 }
 
 /* ------------------------------------------------------------ decoding */
@@ -1695,19 +1730,13 @@ static void trans_one(DisasContext *dc, const DisasInsn *di)
             tcg_gen_and_i32(take, take, pred);
         }
         tcg_gen_movi_i32(target, tgt);
-        tcg_gen_movcond_i32(TCG_COND_NE, cpu_br_target, take,
-                            tcg_constant_i32(0), target, cpu_br_target);
-        tcg_gen_movcond_i32(TCG_COND_NE, cpu_br_taken, take,
-                            tcg_constant_i32(0), tcg_constant_i32(1),
-                            cpu_br_taken);
         if (op->mnem == TIC6X_MNEM_bdec) {
             TCGv_i32 dec = tcg_temp_new_i32();
 
             tcg_gen_subi_i32(dec, cpu_gpr[src], 1);
             wb_pred(dc, pred, src, dec);
         }
-        dc->br_countdown = TIC6X_BRANCH_DELAY;
-        dc->br_just_set = true;
+        br_issue(dc, target, take, false);
         break;
     }
 
@@ -1725,12 +1754,18 @@ static void trans_one(DisasContext *dc, const DisasInsn *di)
         if (!pcrel_target(f, op, insn, di->header, dc->pce1, &tgt)) {
             goto unimplemented;
         }
+        TCGv_i32 target = tcg_temp_new_i32();
+        TCGv_i32 take = tcg_temp_new_i32();
+
         tcg_gen_movi_i32(ret, dc->base.pc_next);
         wb_pred(dc, pred, link, ret);
-        tcg_gen_movi_i32(cpu_br_target, tgt);
-        tcg_gen_movi_i32(cpu_br_taken, 1);
-        dc->br_countdown = 0;       /* lands at the end of this packet */
-        dc->br_just_set = false;
+        tcg_gen_movi_i32(target, tgt);
+        if (pred) {
+            tcg_gen_setcondi_i32(TCG_COND_NE, take, pred, 0);
+        } else {
+            tcg_gen_movi_i32(take, 1);
+        }
+        br_issue(dc, target, take, true);
         break;
     }
 
@@ -1775,6 +1810,7 @@ static void trans_one(DisasContext *dc, const DisasInsn *di)
          * which is why the flag is a run-time value.
          */
         TCGv_i32 target = tcg_temp_new_i32();
+        TCGv_i32 taken = tcg_temp_new_i32();
         uint32_t tgt;
 
         if (pcrel_target(f, op, insn, di->header, dc->pce1, &tgt)) {
@@ -1795,23 +1831,11 @@ static void trans_one(DisasContext *dc, const DisasInsn *di)
             goto unimplemented;
         }
         if (pred) {
-            tcg_gen_movcond_i32(TCG_COND_NE, cpu_br_target, pred,
-                                tcg_constant_i32(0), target, cpu_br_target);
-            tcg_gen_movcond_i32(TCG_COND_NE, cpu_br_taken, pred,
-                                tcg_constant_i32(0), tcg_constant_i32(1),
-                                cpu_br_taken);
+            tcg_gen_setcondi_i32(TCG_COND_NE, taken, pred, 0);
         } else {
-            tcg_gen_mov_i32(cpu_br_target, target);
-            tcg_gen_movi_i32(cpu_br_taken, 1);
+            tcg_gen_movi_i32(taken, 1);
         }
-        if (dc->br_countdown >= 0) {
-            qemu_log_mask(LOG_UNIMP,
-                          "tic6x: a second branch at 0x%08x while one is "
-                          "still in flight; only one is tracked\n",
-                          dc->packet_pc);
-        }
-        dc->br_countdown = TIC6X_BRANCH_DELAY;
-        dc->br_just_set = true;
+        br_issue(dc, target, taken, false);
         break;
     }
 
@@ -2205,7 +2229,7 @@ static uint32_t gen_sploop(CPUState *cs, DisasContext *dc, uint32_t body_pc)
            one there is nothing to end the loop. SPRUFE8B 7.5.1.3. */
         return sp_refuse(dc, body_pc, sp_insn, kind);
     }
-    if (dc->br_countdown >= 0) {
+    if (dc->br_pend) {
         qemu_log_mask(LOG_UNIMP,
                       "tic6x: SPLOOP at 0x%08x inside a branch's delay "
                       "slots; the loop's cycles are not counted\n",
@@ -2590,8 +2614,8 @@ static void tic6x_tr_init_disas_context(DisasContextBase *dcbase,
      * nothing is in flight; otherwise this block starts part way through
      * some earlier branch's delay slots.
      */
-    dc->br_countdown = dc->base.tb->flags ? (int)dc->base.tb->flags : -1;
-    dc->br_just_set = false;
+    dc->br_pend = dc->base.tb->flags & ((1u << TIC6X_BR_SLOTS) - 1);
+    dc->br_new = false;
     dc->nwb = 0;
     dc->sp_start.active = false;
     dc->sp.active = false;
@@ -2610,50 +2634,136 @@ static void tic6x_tr_insn_start(DisasContextBase *dcbase, CPUState *cs)
     tcg_gen_insn_start(dc->base.pc_next, 0, 0);
 }
 
+/*
+ * Advance every branch in flight by the cycles this packet took, place any
+ * the packet issued, and emit the jump for whichever lands here.
+ *
+ * The slots are indexed by how many cycles are left, so a packet of c
+ * cycles moves slot k to slot k - c, and anything that reaches zero or
+ * below has landed. A branch issued by this packet enters at
+ * TIC6X_BRANCH_DELAY minus the packet's own extra cycles: its own cycle is
+ * not one of its delay slots, but the nop cycles a BNOP carries in the same
+ * packet are, which is the whole of what BNOP n means.
+ *
+ * Everything is worked out here at translation time, from a mask that
+ * travels between blocks in the TB flags, so a packet with nothing in
+ * flight - almost all of them - emits nothing at all.
+ */
 static void tic6x_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
     uint32_t pc = dc->base.pc_next;
+    TCGv_i32 was_target[TIC6X_BR_SLOTS];
+    TCGv_i32 was_taken[TIC6X_BR_SLOTS];
+    int from[TIC6X_BR_SLOTS];           /* new slot <- old slot           */
+    int landing = 0;                    /* old slot landing here, or 0    */
+    bool new_lands = false;
+    uint32_t pend = 0;
     int cycles = 1;
-    int len = translate_packet(cs, dc, pc, &cycles);
+    int len, k, nk;
 
+    dc->br_new = false;
+    len = translate_packet(cs, dc, pc, &cycles);
     dc->base.pc_next = pc + len;
 
-    if (dc->br_countdown >= 0) {
-        if (dc->br_just_set) {
-            /*
-             * The branch's own CYCLE is not one of its delay slots, but the
-             * rest of its packet is. That distinction is the whole of BNOP:
-             * BNOP 5 is a branch whose five delay slots are filled by the
-             * nop cycles it carries, so it lands at the end of its own
-             * packet and nothing after it runs. Skipping the packet whole
-             * let five packets execute that the branch had already jumped
-             * over, and the branch they contained won instead.
-             */
-            dc->br_countdown -= cycles - 1;
-            dc->br_just_set = false;
-        } else {
-            dc->br_countdown -= cycles;
-        }
-        /* Keep env in step, so a block ending here does not lose it. */
-        tcg_gen_movi_i32(cpu_br_cnt, dc->br_countdown > 0
-                                     ? dc->br_countdown : 0);
-        if (dc->br_countdown <= 0) {
-            /*
-             * The delay slots are done. If the branch was taken, go to its
-             * target; if it was predicated off, carry straight on.
-             */
-            TCGLabel *not_taken = gen_new_label();
+    if (!dc->br_pend && !dc->br_new) {
+        return;
+    }
 
-            tcg_gen_brcondi_i32(TCG_COND_EQ, cpu_br_taken, 0, not_taken);
-            tcg_gen_movi_i32(cpu_br_taken, 0);
-            tcg_gen_mov_i32(cpu_pc, cpu_br_target);
-            tcg_gen_exit_tb(NULL, 0);
-            gen_set_label(not_taken);
-            tcg_gen_movi_i32(cpu_br_cnt, 0);
-            dc->br_countdown = -1;
-            dc->base.is_jmp = DISAS_TOO_MANY;
+    /*
+     * Copy every slot in flight before moving any of them, so a target
+     * cannot be overwritten by the shuffle before it has been read.
+     */
+    for (k = 1; k < TIC6X_BR_SLOTS; k++) {
+        if (dc->br_pend & (1u << k)) {
+            was_target[k] = tcg_temp_new_i32();
+            was_taken[k] = tcg_temp_new_i32();
+            tcg_gen_mov_i32(was_target[k], cpu_br_target[k]);
+            tcg_gen_mov_i32(was_taken[k], cpu_br_taken[k]);
         }
+    }
+
+    memset(from, 0, sizeof(from));
+    for (k = 1; k < TIC6X_BR_SLOTS; k++) {
+        if ((dc->br_pend & (1u << k)) && k - cycles > 0) {
+            from[k - cycles] = k;
+        }
+    }
+    for (k = 1; k < TIC6X_BR_SLOTS; k++) {
+        if (!(dc->br_pend & (1u << k)) || k - cycles > 0) {
+            continue;
+        }
+        if (!landing) {
+            landing = k;
+            continue;
+        }
+        /*
+         * A multicycle packet can span two landings. The earlier one takes
+         * effect here and the rest follow a packet at a time, which keeps
+         * their order and is at most a cycle late; the alternative is
+         * losing all but one of them.
+         */
+        for (nk = 1; nk < TIC6X_BR_SLOTS && from[nk]; nk++) {
+            continue;
+        }
+        if (nk < TIC6X_BR_SLOTS) {
+            from[nk] = k;
+        }
+        qemu_log_mask(LOG_UNIMP,
+                      "tic6x: two branches land in the packet at 0x%08x; "
+                      "the second is taken a cycle late\n", pc);
+    }
+
+    if (dc->br_new) {
+        int slot = dc->br_new_now ? 0 : TIC6X_BRANCH_DELAY - (cycles - 1);
+
+        if (slot <= 0) {
+            new_lands = true;
+            if (landing) {
+                qemu_log_mask(LOG_UNIMP,
+                              "tic6x: a branch lands in the same packet as "
+                              "one with no delay slots, at 0x%08x\n", pc);
+            }
+        } else if (from[slot]) {
+            qemu_log_mask(LOG_UNIMP,
+                          "tic6x: two branches would land in the same cycle "
+                          "at 0x%08x\n", pc);
+        } else {
+            from[slot] = -1;            /* -1 means "the new one" */
+        }
+    }
+
+    /* Put everything where it now belongs, before any jump can leave. */
+    for (k = 1; k < TIC6X_BR_SLOTS; k++) {
+        if (from[k] > 0) {
+            tcg_gen_mov_i32(cpu_br_target[k], was_target[from[k]]);
+            tcg_gen_mov_i32(cpu_br_taken[k], was_taken[from[k]]);
+        } else if (from[k] < 0) {
+            tcg_gen_mov_i32(cpu_br_target[k], dc->br_new_target);
+            tcg_gen_mov_i32(cpu_br_taken[k], dc->br_new_taken);
+        }
+        if (from[k]) {
+            pend |= 1u << k;
+        }
+    }
+    /* Keep env in step, so a block ending here does not lose the state. */
+    tcg_gen_movi_i32(cpu_br_pend, pend);
+    dc->br_pend = pend;
+
+    if (landing || new_lands) {
+        /*
+         * The delay slots are done. If the branch was taken, go to its
+         * target; if it was predicated off, carry straight on.
+         */
+        TCGv_i32 target = landing ? was_target[landing] : dc->br_new_target;
+        TCGv_i32 taken = landing ? was_taken[landing] : dc->br_new_taken;
+        TCGLabel *not_taken = gen_new_label();
+
+        tcg_gen_brcondi_i32(TCG_COND_EQ, taken, 0, not_taken);
+        tcg_gen_mov_i32(cpu_pc, target);
+        tcg_gen_exit_tb(NULL, 0);
+        gen_set_label(not_taken);
+        dc->base.is_jmp = DISAS_TOO_MANY;
     }
 }
 
@@ -2703,13 +2813,17 @@ void tic6x_translate_init(void)
     }
     cpu_pc = tcg_global_mem_new_i32(tcg_env,
                                     offsetof(CPUTIC6XState, pc), "pc");
-    cpu_br_target = tcg_global_mem_new_i32(tcg_env,
-                                           offsetof(CPUTIC6XState, br_target),
-                                           "br_target");
-    cpu_br_taken = tcg_global_mem_new_i32(tcg_env,
-                                          offsetof(CPUTIC6XState, br_taken),
-                                          "br_taken");
-    cpu_br_cnt = tcg_global_mem_new_i32(tcg_env,
-                                        offsetof(CPUTIC6XState, br_cnt),
-                                        "br_cnt");
+    for (i = 1; i < TIC6X_BR_SLOTS; i++) {
+        char name[16];
+
+        snprintf(name, sizeof(name), "br_target%d", i);
+        cpu_br_target[i] = tcg_global_mem_new_i32(
+            tcg_env, offsetof(CPUTIC6XState, br_target[i]), g_strdup(name));
+        snprintf(name, sizeof(name), "br_taken%d", i);
+        cpu_br_taken[i] = tcg_global_mem_new_i32(
+            tcg_env, offsetof(CPUTIC6XState, br_taken[i]), g_strdup(name));
+    }
+    cpu_br_pend = tcg_global_mem_new_i32(tcg_env,
+                                         offsetof(CPUTIC6XState, br_pend),
+                                         "br_pend");
 }
