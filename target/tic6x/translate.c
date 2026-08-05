@@ -102,6 +102,16 @@ typedef struct DisasContext {
     /* A branch scheduled by the packet being translated right now does not
        consume one of its own delay slots. */
     bool br_just_set;
+
+    /*
+     * The address of the instruction being translated, as opposed to the
+     * packet's. A trap that names only the packet sends you looking at the
+     * wrong address - an execute packet can span two fetch packets, so the
+     * instruction that trapped may be a long way from where the packet
+     * started. That happened: a sploop reported at 0x118047c0 was at
+     * 0x11804838.
+     */
+    uint32_t insn_pc;
 } DisasContext;
 
 static void wb_add(DisasContext *dc, int reg, TCGv_i32 val)
@@ -449,6 +459,7 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
     int cycles = 1;
 
     if (!op) {
+        tcg_gen_movi_i32(cpu_pc, dc->insn_pc);
         gen_helper_illegal(tcg_env, tcg_constant_i32(insn));
         return 1;
     }
@@ -1324,6 +1335,7 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
          * So it traps, and doing it properly means modelling the buffer and
          * its stage predicates. 87 instructions in this firmware use it.
          */
+        tcg_gen_movi_i32(cpu_pc, dc->insn_pc);
         gen_helper_unimplemented(tcg_env, tcg_constant_i32(insn),
                                  tcg_constant_i32(op->mnem));
         break;
@@ -1380,6 +1392,7 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
     }
 
     default:
+        tcg_gen_movi_i32(cpu_pc, dc->insn_pc);
         gen_helper_unimplemented(tcg_env, tcg_constant_i32(insn),
                                  tcg_constant_i32(op->mnem));
         break;
@@ -1495,6 +1508,7 @@ static int translate_packet(CPUState *cs, DisasContext *dc, uint32_t pc,
                     bool parallel;
                     int c;
 
+                    dc->insn_pc = fp_base + i * 4;
                     if (compact) {
                         uint32_t op16 = h ? (w >> 16) : (w & 0xffff);
 
@@ -1521,7 +1535,10 @@ static int translate_packet(CPUState *cs, DisasContext *dc, uint32_t pc,
         } else {
             for (n = slot; n < 8; n++) {
                 uint32_t w = word[n];
-                int c = trans_one(dc, w, 32, 0);
+                int c;
+
+                dc->insn_pc = fp_base + n * 4;
+                c = trans_one(dc, w, 32, 0);
 
                 if (c > *cycles) {
                     *cycles = c;
