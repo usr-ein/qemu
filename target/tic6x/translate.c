@@ -104,6 +104,7 @@ typedef struct {
     uint32_t insn;
     uint32_t pc;
     int bits;
+    uint32_t expansion;         /* the header's PROT/RS/DSZ/BR/SAT bits   */
     const TIC6XOpcode *op;
     const TIC6XFormat *fmt;
 } DisasInsn;
@@ -471,6 +472,43 @@ static TCGv_i32 src1_value(const TIC6XFormat *f, const TIC6XOpcode *op,
 }
 
 /*
+ * The fetch packet header's RS bit moves a compact instruction's register
+ * numbers up into 16-31, except for the few encodings that are marked as
+ * ignoring it. It arrives here as bit 5 of the expansion bits, and it is
+ * zero for 32-bit instructions, which have no such thing.
+ */
+static int insn_reg_base(const TIC6XOpcode *op, uint32_t expansion)
+{
+    return ((expansion >> 5) & 1) && !(op->insn16 & TIC6X_INSN16_NORS)
+           ? 16 : 0;
+}
+
+/*
+ * Which side the DATA register of a load or store is on, which is not the
+ * side its functional unit is on: LDW .D1T2 runs on .D1 and writes B5. The
+ * 32-bit forms say it in s and the compact ones in t, and the table carries
+ * which from binutils' ENC(field, data_fu | rside, ...).
+ */
+static uint32_t insn_data_side(const TIC6XFormat *f, const TIC6XOpcode *op,
+                               uint32_t insn)
+{
+    if (op->data_field < TIC6X_FLD_COUNT &&
+        field_present(f, op->data_field)) {
+        return field_get(f, op->data_field, insn);
+    }
+    return field_present(f, TIC6X_FLD_s) ? field_get(f, TIC6X_FLD_s, insn) : 0;
+}
+
+/* The register a load or store reads or writes, the single-register case. */
+static int data_reg(const TIC6XFormat *f, const TIC6XOpcode *op,
+                    uint32_t insn, uint32_t expansion)
+{
+    return reg_of(insn_data_side(f, op, insn),
+                  insn_reg_base(op, expansion) +
+                  field_get(f, TIC6X_FLD_srcdst, insn));
+}
+
+/*
  * The register a doubleword load or store names.
  *
  * Which field holds it, and how, is not the same across the forms. The
@@ -481,11 +519,12 @@ static TCGv_i32 src1_value(const TIC6XFormat *f, const TIC6XOpcode *op,
  * of them loads or stores A1:A0 and says nothing about it.
  */
 static int dword_reg(const TIC6XFormat *f, const TIC6XOpcode *op,
-                     uint32_t insn, uint32_t side, bool high)
+                     uint32_t insn, uint32_t expansion, bool high)
 {
     static const TIC6XField cand[] = {
         TIC6X_FLD_srcdst, TIC6X_FLD_dst, TIC6X_FLD_src,
     };
+    uint32_t side = insn_data_side(f, op, insn);
     uint32_t num = 0;
     int i;
 
@@ -500,6 +539,8 @@ static int dword_reg(const TIC6XFormat *f, const TIC6XOpcode *op,
         if (enc == TIC6X_ENC_REG_SHIFT) {
             num <<= 1;
         }
+        /* RS applies to the register number, after the shift. */
+        num += insn_reg_base(op, expansion);
         break;
     }
     /* The pair is written A5:A4 and the even register holds the low half. */
@@ -507,43 +548,99 @@ static int dword_reg(const TIC6XFormat *f, const TIC6XOpcode *op,
 }
 
 /*
- * Whether addr_mode() can read this encoding at all.
+ * Where a load or store goes: SPRUFE8B 3.8 for the full-width forms and
+ * 3.10 for the compact ones.
  *
- * The compact memory instructions are a different addressing family: they
- * name their pointer in ptr rather than baseR, their offset in cst, their
- * register file in t, and they carry the mode in the fetch packet header's
- * expansion bits rather than in a mode field. addr_mode() reads none of
- * those, so for a compact form every field it wants is absent and it builds
- * an address out of zeroes - a load from 0 that this machine answers with a
- * quiet nothing. There are 286 of them in this image; they need their own
- * decode, and until then they say so rather than pretend.
+ * The two are the same arithmetic reached by very different encodings. A
+ * 32-bit form carries everything in the instruction - the mode in a mode
+ * field, the pointer in baseR, the offset in offsetR, all on the side the y
+ * bit names. A compact form carries almost none of it: the pointer is a
+ * two-bit ptr field naming one of four registers from 4 up, or B15 where
+ * the encoding says so; the offset may be stored one less than it means;
+ * and the addressing mode is not in the instruction at all but attached to
+ * the encoding, which is why the generator now carries it across.
+ *
+ * Reading the 32-bit fields out of a compact form finds none of them, so it
+ * builds an address out of zeroes and accesses *A0. That is what happened
+ * to all 286 of them in this firmware, silently, until they were made to
+ * trap. Returns false for anything it still cannot read.
  */
-static bool addr_mode_known(const TIC6XFormat *f)
+static bool mem_ref(DisasContext *dc, TCGv_i32 pred, const TIC6XFormat *f,
+                    const TIC6XOpcode *op, uint32_t insn, uint32_t expansion,
+                    int scale, TCGv_i32 *out)
 {
-    return field_present(f, TIC6X_FLD_mode) &&
-           field_present(f, TIC6X_FLD_baseR);
-}
-
-/* The addressing modes of the .D unit load and store, SPRUFE8B 3.8. */
-static TCGv_i32 addr_mode(DisasContext *dc, TCGv_i32 pred,
-                          const TIC6XFormat *f, uint32_t insn, int scale)
-{
-    uint32_t mode = field_get(f, TIC6X_FLD_mode, insn);
-    uint32_t y = field_get(f, TIC6X_FLD_y, insn);
-    uint32_t baseN = field_get(f, TIC6X_FLD_baseR, insn);
-    uint32_t offN = field_get(f, TIC6X_FLD_offsetR, insn);
-    int base = reg_of(y, baseN);
     TCGv_i32 off = tcg_temp_new_i32();
     TCGv_i32 addr = tcg_temp_new_i32();
-    bool reg_offset = mode & 4;
-    bool modify = mode & 8;
-    bool post = modify && (mode & 2);
-    bool add = mode & 1;
+    uint32_t mode, side, raw;
+    bool reg_offset, modify, post, add;
+    int base;
+
+    /* Which side the .D unit is on. Not always s; a 32-bit load says y. */
+    if (op->unit_field >= TIC6X_FLD_COUNT ||
+        !field_present(f, op->unit_field)) {
+        return false;
+    }
+    side = field_get(f, op->unit_field, insn);
+
+    if (op->mem_mode != TIC6X_MEM_MODE_NONE) {
+        uint8_t enc;
+
+        mode = op->mem_mode;
+        if (op->insn16 & TIC6X_INSN16_B15PTR) {
+            base = reg_of(side, 15);
+        } else if (op->ptr_field < TIC6X_FLD_COUNT &&
+                   field_present(f, op->ptr_field)) {
+            base = reg_of(side, 4 | field_get(f, op->ptr_field, insn));
+        } else {
+            return false;
+        }
+        if (op->off_field >= TIC6X_FLD_COUNT ||
+            !field_present(f, op->off_field)) {
+            return false;
+        }
+        enc = op->enc[op->off_field];
+        raw = field_get(f, op->off_field, insn);
+        if (enc == TIC6X_ENC_MEM_OFFSET_M1 ||
+            enc == TIC6X_ENC_MEM_OFFSET_M1_NS) {
+            raw += 1;               /* stored one less than it means */
+        }
+        if (enc == TIC6X_ENC_MEM_OFFSET_NS ||
+            enc == TIC6X_ENC_MEM_OFFSET_M1_NS) {
+            scale = 0;              /* the nonaligned forms' byte offsets */
+        }
+        reg_offset = mode & 4;
+        if (reg_offset) {
+            raw += insn_reg_base(op, expansion);
+        }
+    } else {
+        if (!field_present(f, TIC6X_FLD_mode) ||
+            !field_present(f, TIC6X_FLD_baseR) ||
+            !field_present(f, TIC6X_FLD_offsetR)) {
+            return false;
+        }
+        mode = field_get(f, TIC6X_FLD_mode, insn);
+        base = reg_of(side, field_get(f, TIC6X_FLD_baseR, insn));
+        raw = field_get(f, TIC6X_FLD_offsetR, insn);
+        reg_offset = mode & 4;
+        /*
+         * The nonaligned forms carry an sc bit saying whether the offset is
+         * scaled by the access size or taken as bytes - SPRUFE8B's LDNDW
+         * page, "if sc is 0 the offsetR/ucst5 is not shifted".
+         */
+        if (field_present(f, TIC6X_FLD_sc) &&
+            !field_get(f, TIC6X_FLD_sc, insn)) {
+            scale = 0;
+        }
+    }
+
+    modify = mode & 8;
+    post = modify && (mode & 2);
+    add = mode & 1;
 
     if (reg_offset) {
-        tcg_gen_shli_i32(off, cpu_gpr[reg_of(y, offN)], scale);
+        tcg_gen_shli_i32(off, cpu_gpr[reg_of(side, raw)], scale);
     } else {
-        tcg_gen_movi_i32(off, offN << scale);
+        tcg_gen_movi_i32(off, raw << scale);
     }
 
     if (post) {
@@ -569,7 +666,8 @@ static TCGv_i32 addr_mode(DisasContext *dc, TCGv_i32 pred,
         }
         wb_pred(dc, pred, base, nb);
     }
-    return addr;
+    *out = addr;
+    return true;
 }
 
 /*
@@ -947,8 +1045,7 @@ static void trans_one(DisasContext *dc, const DisasInsn *di)
     case TIC6X_MNEM_ldhu:
     case TIC6X_MNEM_ldb:
     case TIC6X_MNEM_ldbu: {
-        int dst = reg_of(field_get(f, TIC6X_FLD_s, insn),
-                         field_get(f, TIC6X_FLD_srcdst, insn));
+        int dst = data_reg(f, op, insn, di->expansion);
         int scale = op->mnem == TIC6X_MNEM_ldw ? 2 :
                     (op->mnem == TIC6X_MNEM_ldh ||
                      op->mnem == TIC6X_MNEM_ldhu) ? 1 : 0;
@@ -958,10 +1055,9 @@ static void trans_one(DisasContext *dc, const DisasInsn *di)
                    op->mnem == TIC6X_MNEM_ldb ? MO_SB : MO_UB;
         TCGv_i32 addr;
 
-        if (!addr_mode_known(f)) {
+        if (!mem_ref(dc, pred, f, op, insn, di->expansion, scale, &addr)) {
             goto unimplemented;
         }
-        addr = addr_mode(dc, pred, f, insn, scale);
         gen_load(dc, pred, dst, addr, mo);
         break;
     }
@@ -969,18 +1065,16 @@ static void trans_one(DisasContext *dc, const DisasInsn *di)
     case TIC6X_MNEM_stw:
     case TIC6X_MNEM_sth:
     case TIC6X_MNEM_stb: {
-        int src = reg_of(field_get(f, TIC6X_FLD_s, insn),
-                         field_get(f, TIC6X_FLD_srcdst, insn));
+        int src = data_reg(f, op, insn, di->expansion);
         int scale = op->mnem == TIC6X_MNEM_stw ? 2 :
                     op->mnem == TIC6X_MNEM_sth ? 1 : 0;
         MemOp mo = op->mnem == TIC6X_MNEM_stw ? MO_LEUL :
                    op->mnem == TIC6X_MNEM_sth ? MO_LEUW : MO_UB;
         TCGv_i32 addr;
 
-        if (!addr_mode_known(f)) {
+        if (!mem_ref(dc, pred, f, op, insn, di->expansion, scale, &addr)) {
             goto unimplemented;
         }
-        addr = addr_mode(dc, pred, f, insn, scale);
         gen_store(dc, pred, src, addr, mo);
         break;
     }
@@ -1178,23 +1272,13 @@ static void trans_one(DisasContext *dc, const DisasInsn *di)
          */
         bool is_load = op->mnem == TIC6X_MNEM_lddw ||
                        op->mnem == TIC6X_MNEM_ldndw;
-        uint32_t side = field_get(f, TIC6X_FLD_s, insn);
-        int lo = dword_reg(f, op, insn, side, false);
-        int hi = dword_reg(f, op, insn, side, true);
-        /*
-         * The nonaligned forms carry an sc bit saying whether the offset is
-         * scaled by the access size or taken as bytes - SPRUFE8B's LDNDW
-         * page, "if sc is 0 the offsetR/ucst5 is not shifted". The aligned
-         * ones always scale.
-         */
-        int scale = field_present(f, TIC6X_FLD_sc)
-                    ? (field_get(f, TIC6X_FLD_sc, insn) ? 3 : 0) : 3;
+        int lo = dword_reg(f, op, insn, di->expansion, false);
+        int hi = dword_reg(f, op, insn, di->expansion, true);
         TCGv_i32 addr, hiaddr;
 
-        if (!addr_mode_known(f)) {
+        if (!mem_ref(dc, pred, f, op, insn, di->expansion, 3, &addr)) {
             goto unimplemented;
         }
-        addr = addr_mode(dc, pred, f, insn, scale);
         hiaddr = tcg_temp_new_i32();
         tcg_gen_addi_i32(hiaddr, addr, 4);
         /* Two word accesses rather than one inline pair, so that a load in
@@ -1217,9 +1301,8 @@ static void trans_one(DisasContext *dc, const DisasInsn *di)
          * doubleword load; the linked-store side would need modelling before
          * that is more than a convenience.
          */
-        uint32_t num = field_get(f, TIC6X_FLD_dst, insn);
-        int lo = reg_of(s, num & ~1u);
-        int hi = reg_of(s, (num & ~1u) | 1u);
+        int lo = dword_reg(f, op, insn, di->expansion, false);
+        int hi = dword_reg(f, op, insn, di->expansion, true);
         int base = reg_of(s, field_get(f, TIC6X_FLD_src2, insn));
         TCGv_i32 hiaddr = tcg_temp_new_i32();
 
@@ -1233,14 +1316,12 @@ static void trans_one(DisasContext *dc, const DisasInsn *di)
     case TIC6X_MNEM_stnw: {
         /* Nonaligned word; the same as ldw and stw to a model that does not
            fault on alignment. */
-        int reg = reg_of(field_get(f, TIC6X_FLD_s, insn),
-                         field_get(f, TIC6X_FLD_srcdst, insn));
+        int reg = data_reg(f, op, insn, di->expansion);
         TCGv_i32 addr;
 
-        if (!addr_mode_known(f)) {
+        if (!mem_ref(dc, pred, f, op, insn, di->expansion, 2, &addr)) {
             goto unimplemented;
         }
-        addr = addr_mode(dc, pred, f, insn, 2);
         if (op->mnem == TIC6X_MNEM_ldnw) {
             gen_load(dc, pred, reg, addr, MO_LEUL);
         } else {
@@ -1653,6 +1734,7 @@ static void scan_one(DisasPacket *pk, uint32_t insn, int bits,
     di->insn = insn;
     di->bits = bits;
     di->pc = pc;
+    di->expansion = expansion;
     di->op = decode(insn, bits, expansion, &di->fmt);
     if (di->op) {
         int c = insn_cycles(di->op, di->fmt, insn);
@@ -1911,7 +1993,6 @@ static int sp_load_regs(const DisasInsn *di, int *regs)
 {
     const TIC6XFormat *f = di->fmt;
     uint32_t insn = di->insn;
-    uint32_t side;
 
     if (!di->op) {
         return 0;
@@ -1923,17 +2004,14 @@ static int sp_load_regs(const DisasInsn *di, int *regs)
     case TIC6X_MNEM_ldb:
     case TIC6X_MNEM_ldbu:
     case TIC6X_MNEM_ldnw:
-        regs[0] = reg_of(field_get(f, TIC6X_FLD_s, insn),
-                         field_get(f, TIC6X_FLD_srcdst, insn));
+        regs[0] = data_reg(f, di->op, insn, di->expansion);
         return 1;
 
     case TIC6X_MNEM_lddw:
     case TIC6X_MNEM_ldndw:
     case TIC6X_MNEM_cmtl:
-        side = field_present(f, TIC6X_FLD_s)
-               ? field_get(f, TIC6X_FLD_s, insn) : 0;
-        regs[0] = dword_reg(f, di->op, insn, side, false);
-        regs[1] = dword_reg(f, di->op, insn, side, true);
+        regs[0] = dword_reg(f, di->op, insn, di->expansion, false);
+        regs[1] = dword_reg(f, di->op, insn, di->expansion, true);
         return 2;
 
     default:
