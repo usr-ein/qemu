@@ -39,6 +39,7 @@
 #include "system/memory.h"
 #include "system/reset.h"
 #include "qemu/log.h"
+#include "hw/core/cpu.h"
 #include "target/sh4/cpu.h"
 
 /*
@@ -110,6 +111,11 @@ typedef struct CDJ2KNXSDSP {
     uint8_t *mem;
 } CDJ2KNXSDSP;
 
+static uint32_t cdj2knxs_guest_pc(void)
+{
+    return current_cpu ? SUPERH_CPU(current_cpu)->env.pc : 0;
+}
+
 static uint64_t cdj2knxs_dsp_read(void *opaque, hwaddr off, unsigned size)
 {
     CDJ2KNXSDSP *s = opaque;
@@ -127,7 +133,8 @@ static uint64_t cdj2knxs_dsp_read(void *opaque, hwaddr off, unsigned size)
     default:                            /* HPID, either window */
         memcpy(&v, s->mem + (s->hpia & (CDJ2KNXS_DSP_MEM - 1)), 4);
         if (s->mbox_armed && getenv("CDJ_DSP_MBOX") && s->mbox_log++ < 200) {
-            qemu_log("mbox: read  0x%08x = 0x%08x\n", s->hpia, v);
+            qemu_log("mbox: read  0x%08x = 0x%08x  from pc 0x%08x\n",
+                     s->hpia, v, cdj2knxs_guest_pc());
         }
         if (s->mbox_armed) {
             s->mbox_armed--;
@@ -173,7 +180,8 @@ static void cdj2knxs_dsp_write(void *opaque, hwaddr off, uint64_t value,
         return;
     default:
         if (s->mbox_armed && getenv("CDJ_DSP_MBOX") && s->mbox_log++ < 200) {
-            qemu_log("mbox: write 0x%08x = 0x%08x\n", s->hpia, v);
+            qemu_log("mbox: write 0x%08x = 0x%08x  from pc 0x%08x\n",
+                     s->hpia, v, cdj2knxs_guest_pc());
         }
         if (s->mbox_armed) {
             s->mbox_armed--;
