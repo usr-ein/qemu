@@ -163,6 +163,25 @@ static void sh7764_dma_run(SH7764State *s, int ch)
     trace_sh7764_dma_run(ch, src, dst, (uint64_t)count * unit, unit);
 
     /*
+     * A gdb write watchpoint cannot see a DMA: the store never goes through
+     * the CPU. So a variable that is plainly being set, with no watchpoint
+     * hit anywhere, is a variable a channel is writing - and until you can
+     * rule that out you cannot tell "nothing writes this" from "nothing the
+     * CPU does writes this". Name the address in CDJ_DMA_WATCH and every
+     * transfer whose destination covers it says so.
+     */
+    if (getenv("CDJ_DMA_WATCH")) {
+        uint32_t want = strtoul(getenv("CDJ_DMA_WATCH"), NULL, 0);
+        uint64_t span = (uint64_t)count * unit;
+
+        if (dstep && want >= dst && want < dst + span) {
+            qemu_log("dma: ch%d writes 0x%08x (0x%08x..0x%08x from 0x%08x) "
+                     "pc 0x%08x\n", ch, want, dst, (uint32_t)(dst + span - 1),
+                     src, current_cpu ? SUPERH_CPU(current_cpu)->env.pc : 0);
+        }
+    }
+
+    /*
      * Real hardware would run this in the background and raise TE when it
      * finishes. Firmware only ever polls TE, so completing synchronously is
      * indistinguishable and avoids modelling bus arbitration.
@@ -1654,6 +1673,13 @@ static void sh7764_panel_deliver(SH7764State *s)
         memcpy(s->panel_last, s->panel_rx_buf, len);
         s->panel_have_last = true;
     }
+    if (getenv("CDJ_PANEL_TRACE")) {
+        qemu_log("panel: deliver %u bytes to 0x%08x  %02x %02x %02x %02x "
+                 "%02x %02x %02x %02x\n", len, sh7764_dma_addr(s->dar[ch]),
+                 s->panel_rx_buf[0], s->panel_rx_buf[1], s->panel_rx_buf[2],
+                 s->panel_rx_buf[3], s->panel_rx_buf[4], s->panel_rx_buf[5],
+                 s->panel_rx_buf[6], s->panel_rx_buf[7]);
+    }
     address_space_write(&address_space_memory, sh7764_dma_addr(s->dar[ch]),
                         MEMTXATTRS_UNSPECIFIED, s->panel_rx_buf, len);
     trace_sh7764_dma_run(ch, 0, sh7764_dma_addr(s->dar[ch]), len, 1);
@@ -1688,6 +1714,10 @@ static void sh7764_panel_receive(void *opaque, const uint8_t *buf, int size)
     }
     memcpy(s->panel_rx_buf + s->panel_rx_len, buf, size);
     s->panel_rx_len += size;
+    if (getenv("CDJ_PANEL_TRACE")) {
+        qemu_log("panel: receive %d bytes, buffered %u, armed %d\n",
+                 size, s->panel_rx_len, s->panel_rx_chan);
+    }
     sh7764_panel_deliver(s);
 }
 

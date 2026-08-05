@@ -125,7 +125,8 @@ static uint64_t cdj2knxs_dsp_read(void *opaque, hwaddr off, unsigned size)
     case 0:                             /* HPIC, mirrored, always ready */
         v = (s->hpic | CDJ2KNXS_HPIC_HRDY) & 0xffff;
         if (getenv("CDJ_DSP_TRACE")) {
-            qemu_log("dsp: read HPIC = 0x%08x\n", v | (v << 16));
+            qemu_log("dsp: read HPIC = 0x%08x  from pc 0x%08x\n",
+                     v | (v << 16), cdj2knxs_guest_pc());
         }
         return v | (v << 16);
     case 1:
@@ -154,7 +155,8 @@ static void cdj2knxs_dsp_write(void *opaque, hwaddr off, uint64_t value,
     switch (off / CDJ2KNXS_DSP_STRIDE) {
     case 0:
         if (getenv("CDJ_DSP_TRACE")) {
-            qemu_log("dsp: write HPIC = 0x%08x\n", v);
+            qemu_log("dsp: write HPIC = 0x%08x  from pc 0x%08x\n",
+                     v, cdj2knxs_guest_pc());
         }
         s->hpic = (s->hpic & ~CDJ2KNXS_HPIC_HWOB) | (v & CDJ2KNXS_HPIC_HWOB);
         if (v & CDJ2KNXS_HPIC_HINT) {
@@ -168,8 +170,8 @@ static void cdj2knxs_dsp_write(void *opaque, hwaddr off, uint64_t value,
         return;
     case 1:
         if (getenv("CDJ_DSP_TRACE")) {
-            qemu_log("dsp: write HPIA = 0x%08x (after %u data words)\n",
-                     v, s->words);
+            qemu_log("dsp: write HPIA = 0x%08x (after %u data words)"
+                     "  from pc 0x%08x\n", v, s->words, cdj2knxs_guest_pc());
             s->words = 0;
         }
         s->hpia = v;
