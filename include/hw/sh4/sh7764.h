@@ -50,6 +50,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(SH7764State, SH7764)
 #define SH7764_INTC_BASE        0xffd00000  /* IRQ-side INTC registers        */
 #define SH7764_INTC_SIZE        0x00001000
 #define SH7764_TMU_BASE         0xffd80000  /* TMU channels 0-2               */
+/*
+ * The second timer unit, channels 3 to 5, section 14. Same register layout as
+ * the first: TSTR1 at +0x0004 with the channels from +0x0008. The firmware
+ * drives it - it was reaching the catch-all at 0xFFDC0000 to 0xFFDC0028 -
+ * and one of the things it times is the DSP, whose failure it reports as
+ * "DSP out irregular stop 6sec over".
+ */
+#define SH7764_TMU1_BASE        0xffdc0000  /* TMU channels 3-5               */
 #define SH7764_SSI_A_BASE       0xff400000  /* serial sound interface A       */
 #define SH7764_SSI_B_BASE       0xff500000  /* serial sound interface B       */
 #define SH7764_SSI_SIZE         0x00008000
@@ -111,7 +119,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(SH7764State, SH7764)
 #define SH7764_DMAC_CHB_STRIDE  0x0010
 #define SH7764_DMAC_NCHAN       6
 #define SH7764_DMAC_NCHAN_B     4
-#define SH7764_DMAC_DMARS       0x9000      /* 16-bit, one per channel pair   */
+/*
+ * The extended resource selectors, section 12.3.9, live at H'FF60 9000 - that
+ * is 0x1000 into this window, not 0x9000. At 0x9000 they sat outside the
+ * region entirely, so every write to them fell through to the catch-all and
+ * the channels that select their peripheral this way ran with whatever the
+ * reset value implied.
+ */
+#define SH7764_DMAC_DMARS       0x1000      /* 16-bit, one per channel pair   */
 #define SH7764_DMAC_NDMARS      3
 
 #define SH7764_DMAC_SAR         0x00

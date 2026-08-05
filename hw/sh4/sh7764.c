@@ -48,6 +48,7 @@ enum {
     UNUSED = 0,
     /* TMU */
     TUNI0, TUNI1, TUNI2, TICPI2,
+    TUNI3, TUNI4, TUNI5,
     /* SCIF0 and SCIF2 */
     SCIF0_ERI, SCIF0_RXI, SCIF0_BRI, SCIF0_TXI,
     SCIF2_ERI, SCIF2_RXI, SCIF2_BRI, SCIF2_TXI,
@@ -60,7 +61,7 @@ enum {
     USBI,
     DMINT1,
     /* groups */
-    SCIF0, SCIF2, SSI_B,
+    SCIF0, SCIF2, SSI_B, TMU0_UNIT, TMU1_UNIT,
     NR_INTC_SOURCES,
 };
 
@@ -1852,6 +1853,8 @@ static void sh7764_scif_init(SH7764State *s, hwaddr base, int chan_index,
 static struct intc_vect sh7764_vectors[] = {
     INTC_VECT(TUNI0, 0x580), INTC_VECT(TUNI1, 0x5a0),
     INTC_VECT(TUNI2, 0x5c0), INTC_VECT(TICPI2, 0x5e0),
+    INTC_VECT(TUNI3, 0xe00), INTC_VECT(TUNI4, 0xe20),
+    INTC_VECT(TUNI5, 0xe40),
     INTC_VECT(WDT_ITI, 0x560),
     INTC_VECT(ATAPI_ATAI, 0xc00),
     INTC_VECT(SSI_ADMA0, 0xa00), INTC_VECT(SSI_BDMA1, 0xaa0),
@@ -1876,6 +1879,15 @@ static struct intc_group sh7764_groups[] = {
      * each, so they stay independent.
      */
     INTC_GROUP(SSI_B, SSI_BDMA1, SSI_BCH3),
+    /*
+     * Each timer channel has its own priority field, but a whole unit shares
+     * one mask bit: INT2MSKR[0] gates channels 0 to 2 and INT2MSKR[1] gates 3
+     * to 5. Bit 1 was wired straight to TUNI1, which is neither - unmasking
+     * the first unit left TUNI1 and TUNI2 masked, and nothing could enable
+     * the second unit at all.
+     */
+    INTC_GROUP(TMU0_UNIT, TUNI0, TUNI1, TUNI2, TICPI2),
+    INTC_GROUP(TMU1_UNIT, TUNI3, TUNI4, TUNI5),
 };
 
 /*
@@ -1887,6 +1899,7 @@ static struct intc_group sh7764_groups[] = {
  */
 static struct intc_prio_reg sh7764_prio_registers[] = {
     { 0xffd40000, 0, 32, 8, /* INT2PRI0 */ { TUNI0, TUNI1, TUNI2, TICPI2 } },
+    { 0xffd40004, 0, 32, 8, /* INT2PRI1 */ { TUNI3, TUNI4, TUNI5, UNUSED } },
     { 0xffd40008, 0, 32, 8, /* INT2PRI2 */ { SCIF0, UNUSED, WDT_ITI, UNUSED } },
     { 0xffd4000c, 0, 32, 8, /* INT2PRI3 */
       { UNUSED, DMINT1, UNUSED, UNUSED } },
@@ -1917,7 +1930,7 @@ static struct intc_mask_reg sh7764_mask_registers[] = {
       { 0, 0, 0, 0, 0, 0, 0, 0,                 /* 31..24 */
         0, 0, 0, ATAPI_ATAI, SSI_B, 0, 0, 0,            /* 23..16 */
         SSI_ACH0, SSI_ADMA0, 0, 0, 0, 0, 0, DMINT1,     /* 15..8  */
-        0, 0, WDT_ITI, SCIF0, 0, 0, TUNI1, TUNI0 },     /* 7..0 */
+        0, 0, WDT_ITI, SCIF0, 0, 0, TMU1_UNIT, TMU0_UNIT },  /* 7..0 */
       0, true },
     { 0xffd400d4, 0xffd400d0, 32, /* INT2MSKCR1 / INT2MSKR1 */
       { 0, 0, 0, 0, 0, 0, SCIF2, 0,             /* 31..24 */
@@ -2076,6 +2089,16 @@ static void sh7764_realize(DeviceState *dev, Error **errp)
                 s->periph_freq,
                 s->intc.irqs[TUNI0], s->intc.irqs[TUNI1],
                 s->intc.irqs[TUNI2], s->intc.irqs[TICPI2]);
+    /*
+     * Channels 3 to 5. Same shape as the first unit, and the firmware uses
+     * them: without this its accesses fell through to the catch-all, the
+     * counters never ran, and anything it timed with them never expired.
+     */
+    tmu012_init(sysmem, SH7764_TMU1_BASE,
+                TMU012_FEAT_TOCR | TMU012_FEAT_3CHAN,
+                s->periph_freq,
+                s->intc.irqs[TUNI3], s->intc.irqs[TUNI4],
+                s->intc.irqs[TUNI5], s->intc.irqs[TUNI5]);
 }
 
 static void sh7764_reset(DeviceState *dev)
