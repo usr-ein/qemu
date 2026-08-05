@@ -219,6 +219,19 @@ static void cdj2knxs_dsp_write(void *opaque, hwaddr off, uint64_t value,
                      "  from pc 0x%08x\n", v, s->words, cdj2knxs_guest_pc());
             s->words = 0;
         }
+        /*
+         * After a bulk transfer, write out what the DSP has been given. The
+         * firmware is the only source for that program - it is not a separate
+         * file anywhere - so this is how to get hold of it in order to
+         * disassemble it and, eventually, to run it. Each bulk transfer
+         * overwrites the file, so what is left is the state after the last
+         * one. It goes wherever the variable points, which must be outside
+         * this repository: the image is Pioneer's.
+         */
+        if (s->words >= 1000 && getenv("CDJ_DSP_DUMP")) {
+            g_file_set_contents(getenv("CDJ_DSP_DUMP"), (char *)s->mem,
+                                CDJ2KNXS_DSP_MEM, NULL);
+        }
         s->hpia = v;
         return;
     default:
