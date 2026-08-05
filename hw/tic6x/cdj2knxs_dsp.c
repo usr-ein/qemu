@@ -109,6 +109,8 @@ static void cdj2knxs_dsp_watch(MemoryRegion *sysmem, const char *name,
 typedef struct {
     ArchCPU *cpu;
     QEMUTimer *timer;
+    int delay_ms;
+    bool waited;
 } CDJ2KNXSDSPStart;
 
 static void cdj2knxs_dsp_poll_entry(void *opaque)
@@ -123,6 +125,19 @@ static void cdj2knxs_dsp_poll_entry(void *opaque)
 
     if (entry >= CDJ_DSP_L2_BASE &&
         entry < CDJ_DSP_L2_BASE + CDJ_DSP_L2_SIZE) {
+        /*
+         * The host writes 41 blocks of 32 KB to 0x11837800 AFTER the DSPINT
+         * that releases the core, so with shared memory the DSP races them.
+         * Real hardware has the same race and the firmware presumably copes,
+         * but CDJ_DSP_DELAY_MS holds the core back so the theory can be
+         * tested rather than argued about.
+         */
+        if (st->delay_ms && !st->waited) {
+            st->waited = true;
+            timer_mod(st->timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + st->delay_ms);
+            return;
+        }
         cpu_env(cs)->pc = entry;
         cs->halted = 0;
         cpu_resume(cs);
@@ -142,6 +157,8 @@ static void cdj2knxs_dsp_wait_for_entry(ArchCPU *cpu)
 
     CPU(cpu)->halted = 1;
     st->cpu = cpu;
+    st->delay_ms = getenv("CDJ_DSP_DELAY_MS")
+                   ? atoi(getenv("CDJ_DSP_DELAY_MS")) : 0;
     st->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, cdj2knxs_dsp_poll_entry, st);
     timer_mod(st->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
 }
