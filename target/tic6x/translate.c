@@ -105,6 +105,7 @@ typedef struct {
     uint32_t pc;
     int bits;
     uint32_t expansion;         /* the header's PROT/RS/DSZ/BR/SAT bits   */
+    bool header;                /* its fetch packet was header-based      */
     const TIC6XOpcode *op;
     const TIC6XFormat *fmt;
 } DisasInsn;
@@ -252,6 +253,68 @@ static uint32_t field_get(const TIC6XFormat *f, TIC6XField id, uint32_t insn)
 static bool field_present(const TIC6XFormat *f, TIC6XField id)
 {
     return f->field[id].npieces != 0;
+}
+
+static int field_width(const TIC6XFormat *f, TIC6XField id)
+{
+    const TIC6XFieldDef *d = &f->field[id];
+    int i, w = 0;
+
+    for (i = 0; i < d->npieces; i++) {
+        w += d->piece[i].width;
+    }
+    return w;
+}
+
+/*
+ * Where a PC-relative instruction points.
+ *
+ * Three things here are not what they look like, and all three were wrong.
+ *
+ * The displacement is not always in a field called cst. B has it in cst, but
+ * BNOP's full-width form has it in src2, BDEC and BPOS have it in src, and
+ * ADDKPC in src1. Reading cst regardless finds nothing in the last three and
+ * makes every one of them point at its own fetch packet.
+ *
+ * The field's width varies from seven bits to twenty-one, so the sign
+ * extension has to come from the format rather than from a constant.
+ *
+ * And the scale is not always four. binutils calls the coding pcrel_half and
+ * doubles rather than quadruples when the fetch packet is header-based,
+ * which is how a compact branch reaches an odd multiple of two words. Thirty
+ * five compact branches and forty-two full-width BNOPs in this image use it;
+ * at four they land twice as far away as they meant to.
+ *
+ * The base is PCE1, the address of the FETCH packet - not of the execute
+ * packet the instruction is in.
+ */
+static bool pcrel_target(const TIC6XFormat *f, const TIC6XOpcode *op,
+                         uint32_t insn, bool header, uint32_t pce1,
+                         uint32_t *out)
+{
+    int i;
+
+    for (i = 0; i < TIC6X_FLD_COUNT; i++) {
+        uint8_t enc = op->enc[i];
+        uint32_t raw;
+        int width;
+        int32_t disp;
+
+        if ((enc != TIC6X_ENC_PCREL && enc != TIC6X_ENC_PCREL_HALF &&
+             enc != TIC6X_ENC_PCREL_HALF_U) || !field_present(f, i)) {
+            continue;
+        }
+        raw = field_get(f, i, insn);
+        if (enc == TIC6X_ENC_PCREL_HALF_U) {
+            *out = pce1 + raw * 2;      /* unsigned, in halfwords */
+            return true;
+        }
+        width = field_width(f, i);
+        disp = (int32_t)(raw << (32 - width)) >> (32 - width);
+        *out = pce1 + (disp << (enc == TIC6X_ENC_PCREL_HALF && header ? 1 : 2));
+        return true;
+    }
+    return false;
 }
 
 /*
@@ -756,37 +819,41 @@ static void gen_store(DisasContext *dc, TCGv_i32 pred, int src,
  * branch's delay slots are counted in, and what an SPLOOP body's stage
  * boundaries are measured in.
  *
- * The count lives in a different field in each encoding and is stored one
- * less than it means - binutils' ucst_minus_one. Reading a field the format
- * does not have, which is what this used to do, makes every NOP n a NOP 1.
+ * The count is in a field with a different NAME in every encoding - op in
+ * the full-width NOP, n in the compact one and in the compact branches,
+ * src1 in the full-width BNOP, src2 in ADDKPC - so it is found by its
+ * coding instead. Looking it up by name found nothing and made every one of
+ * them a single cycle, which is how a BNOP 5 stopped covering its own delay
+ * slots and let five packets run that it had already branched over.
  */
 static int insn_cycles(const TIC6XOpcode *op, const TIC6XFormat *f,
                        uint32_t insn)
 {
+    TIC6XCoding want;
+    int i;
+
     switch (op->mnem) {
     case TIC6X_MNEM_nop:
-        /* op in the 32-bit form, n in the compact one. */
-        if (field_present(f, TIC6X_FLD_op)) {
-            return field_get(f, TIC6X_FLD_op, insn) + 1;
-        }
-        if (field_present(f, TIC6X_FLD_n)) {
-            return field_get(f, TIC6X_FLD_n, insn) + 1;
-        }
-        return 1;
-
-    case TIC6X_MNEM_addkpc:
-        /* dst = return address, then src2 cycles of nop. */
-        return field_present(f, TIC6X_FLD_src2)
-               ? field_get(f, TIC6X_FLD_src2, insn) + 1 : 1;
+        /* Stored one less than it means. */
+        want = TIC6X_ENC_UCST_M1;
+        break;
 
     case TIC6X_MNEM_bnop:
-        /* A branch carrying the nops that fill its own delay slots. */
-        return field_present(f, TIC6X_FLD_n)
-               ? field_get(f, TIC6X_FLD_n, insn) + 1 : 1;
+    case TIC6X_MNEM_addkpc:
+        /* A branch or a link-address that carries its own nop cycles. */
+        want = TIC6X_ENC_UCST;
+        break;
 
     default:
         return 1;
     }
+
+    for (i = 0; i < TIC6X_FLD_COUNT; i++) {
+        if (op->enc[i] == want && field_present(f, i)) {
+            return field_get(f, i, insn) + 1;
+        }
+    }
+    return 1;
 }
 
 /* Translate one instruction of an execute packet. */
@@ -807,6 +874,32 @@ static void trans_one(DisasContext *dc, const DisasInsn *di)
     if (field_present(f, TIC6X_FLD_creg)) {
         creg = field_get(f, TIC6X_FLD_creg, insn);
         z = field_get(f, TIC6X_FLD_z, insn);
+    } else if (op->insn16 & TIC6X_INSN16_SPRED) {
+        /*
+         * A compact instruction has no room for creg, so the ones that can
+         * be predicated are predicated on A0 or B0 and say which in the
+         * same s field that picks their functional unit, with z for the
+         * sense. Two bits in a cc field where the format has one.
+         *
+         * Missing this does not make anything trap: the instruction simply
+         * runs when it should not have. The branch at 0x11804320 in this
+         * firmware is [!A0] BNOP, and running it unconditionally sends the
+         * DSP somewhere it never meant to go.
+         */
+        uint32_t sel;
+
+        if (field_present(f, TIC6X_FLD_cc)) {
+            uint32_t cc = field_get(f, TIC6X_FLD_cc, insn);
+
+            sel = (cc >> 1) & 1;
+            z = cc & 1;
+        } else {
+            sel = field_present(f, TIC6X_FLD_s)
+                  ? field_get(f, TIC6X_FLD_s, insn) : 0;
+            z = field_present(f, TIC6X_FLD_z)
+                ? field_get(f, TIC6X_FLD_z, insn) : 0;
+        }
+        creg = sel ? 1 : 6;             /* B0, or A0 */
     }
     pred = insn_pred(dc, creg, z);
     s = field_present(f, TIC6X_FLD_s) ? field_get(f, TIC6X_FLD_s, insn) : 0;
@@ -1215,10 +1308,13 @@ static void trans_one(DisasContext *dc, const DisasInsn *di)
          * of its delay slots, leaves the address to come back to.
          */
         int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
-        int32_t disp = (int32_t)(field_get(f, TIC6X_FLD_src1, insn) << 25) >> 25;
         TCGv_i32 v = tcg_temp_new_i32();
+        uint32_t tgt;
 
-        tcg_gen_movi_i32(v, dc->pce1 + (disp << 2));
+        if (!pcrel_target(f, op, insn, di->header, dc->pce1, &tgt)) {
+            goto unimplemented;
+        }
+        tcg_gen_movi_i32(v, tgt);
         wb_pred(dc, pred, dst, v);
         break;
     }
@@ -1586,16 +1682,19 @@ static void trans_one(DisasContext *dc, const DisasInsn *di)
          * the decrement happens whether or not the branch is taken, which is
          * what makes it a loop counter.
          */
-        int src = reg_of(s, field_get(f, TIC6X_FLD_src2, insn));
-        int32_t disp = (int32_t)(field_get(f, TIC6X_FLD_cst, insn) << 22) >> 22;
+        int src = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
         TCGv_i32 take = tcg_temp_new_i32();
         TCGv_i32 target = tcg_temp_new_i32();
+        uint32_t tgt;
 
+        if (!pcrel_target(f, op, insn, di->header, dc->pce1, &tgt)) {
+            goto unimplemented;
+        }
         tcg_gen_setcondi_i32(TCG_COND_GE, take, cpu_gpr[src], 0);
         if (pred) {
             tcg_gen_and_i32(take, take, pred);
         }
-        tcg_gen_movi_i32(target, dc->pce1 + (disp << 2));
+        tcg_gen_movi_i32(target, tgt);
         tcg_gen_movcond_i32(TCG_COND_NE, cpu_br_target, take,
                             tcg_constant_i32(0), target, cpu_br_target);
         tcg_gen_movcond_i32(TCG_COND_NE, cpu_br_taken, take,
@@ -1620,12 +1719,15 @@ static void trans_one(DisasContext *dc, const DisasInsn *di)
          * execute packet and the branch takes effect immediately.
          */
         int link = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
-        int32_t disp = (int32_t)(field_get(f, TIC6X_FLD_cst, insn) << 11) >> 11;
         TCGv_i32 ret = tcg_temp_new_i32();
+        uint32_t tgt;
 
+        if (!pcrel_target(f, op, insn, di->header, dc->pce1, &tgt)) {
+            goto unimplemented;
+        }
         tcg_gen_movi_i32(ret, dc->base.pc_next);
         wb_pred(dc, pred, link, ret);
-        tcg_gen_movi_i32(cpu_br_target, dc->pce1 + (disp << 2));
+        tcg_gen_movi_i32(cpu_br_target, tgt);
         tcg_gen_movi_i32(cpu_br_taken, 1);
         dc->br_countdown = 0;       /* lands at the end of this packet */
         dc->br_just_set = false;
@@ -1673,18 +1775,24 @@ static void trans_one(DisasContext *dc, const DisasInsn *di)
          * which is why the flag is a run-time value.
          */
         TCGv_i32 target = tcg_temp_new_i32();
+        uint32_t tgt;
 
-        if (field_present(f, TIC6X_FLD_src2) &&
-            !field_present(f, TIC6X_FLD_cst)) {
+        if (pcrel_target(f, op, insn, di->header, dc->pce1, &tgt)) {
+            tcg_gen_movi_i32(target, tgt);
+        } else if (field_present(f, TIC6X_FLD_src2)) {
+            /*
+             * A branch to a register. The compact form's register is always
+             * on the B side - binutils' reg_bside_nors operand - and every
+             * one of the thirty three in this image has s = 1, so the usual
+             * s ^ x lands on the same place; a compact branch encoded with
+             * s = 0 would not, and there are none to check against.
+             */
             tcg_gen_mov_i32(target,
                             cpu_gpr[reg_of(s ^ x,
                                            field_get(f, TIC6X_FLD_src2,
                                                      insn))]);
         } else {
-            uint32_t raw = field_get(f, TIC6X_FLD_cst, insn);
-            int32_t disp = (int32_t)(raw << 11) >> 11;   /* scst21 */
-
-            tcg_gen_movi_i32(target, dc->pce1 + (disp << 2));
+            goto unimplemented;
         }
         if (pred) {
             tcg_gen_movcond_i32(TCG_COND_NE, cpu_br_target, pred,
@@ -1720,7 +1828,7 @@ static void trans_one(DisasContext *dc, const DisasInsn *di)
 
 /* Decode one instruction into a packet, and let it claim its cycles. */
 static void scan_one(DisasPacket *pk, uint32_t insn, int bits,
-                     uint32_t expansion, uint32_t pc)
+                     uint32_t expansion, bool header, uint32_t pc)
 {
     DisasInsn *di;
 
@@ -1735,6 +1843,7 @@ static void scan_one(DisasPacket *pk, uint32_t insn, int bits,
     di->bits = bits;
     di->pc = pc;
     di->expansion = expansion;
+    di->header = header;
     di->op = decode(insn, bits, expansion, &di->fmt);
     if (di->op) {
         int c = insn_cycles(di->op, di->fmt, insn);
@@ -1856,10 +1965,11 @@ static void scan_packet(CPUState *cs, DisasContext *dc, uint32_t pc,
                     if (compact) {
                         uint32_t op16 = h ? (w >> 16) : (w & 0xffff);
 
-                        scan_one(pk, op16, 16, expansion, fp_base + i * 4);
+                        scan_one(pk, op16, 16, expansion, true,
+                                 fp_base + i * 4);
                         parallel = pbits & (1u << (2 * i + h));
                     } else {
-                        scan_one(pk, w, 32, 0, fp_base + i * 4);
+                        scan_one(pk, w, 32, 0, true, fp_base + i * 4);
                         parallel = w & 1;
                     }
                     if (!parallel) {
@@ -1877,7 +1987,7 @@ static void scan_packet(CPUState *cs, DisasContext *dc, uint32_t pc,
             for (n = slot; n < 8; n++) {
                 uint32_t w = word[n];
 
-                scan_one(pk, w, 32, 0, fp_base + n * 4);
+                scan_one(pk, w, 32, 0, false, fp_base + n * 4);
                 if (!(w & 1)) {
                     consumed += (n - slot) * 4 + 4;
                     ended = true;
@@ -2511,7 +2621,16 @@ static void tic6x_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
 
     if (dc->br_countdown >= 0) {
         if (dc->br_just_set) {
-            /* The branch's own packet is not one of its delay slots. */
+            /*
+             * The branch's own CYCLE is not one of its delay slots, but the
+             * rest of its packet is. That distinction is the whole of BNOP:
+             * BNOP 5 is a branch whose five delay slots are filled by the
+             * nop cycles it carries, so it lands at the end of its own
+             * packet and nothing after it runs. Skipping the packet whole
+             * let five packets execute that the branch had already jumped
+             * over, and the branch they contained won instead.
+             */
+            dc->br_countdown -= cycles - 1;
             dc->br_just_set = false;
         } else {
             dc->br_countdown -= cycles;
