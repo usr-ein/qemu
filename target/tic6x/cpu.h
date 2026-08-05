@@ -110,8 +110,19 @@ enum {
     TIC6X_EXCP_UNIMPLEMENTED,   /* an encoding this model does not run    */
     TIC6X_EXCP_ILLEGAL,         /* no encoding matched at all             */
     TIC6X_EXCP_FETCH_ABORT,     /* fetched from somewhere with no memory  */
+    TIC6X_EXCP_SPLOOP_RUNAWAY,  /* an SPLOOP whose end never came         */
     TIC6X_EXCP_INTERRUPT,
 };
+
+/*
+ * A software-pipelined loop is generated as one translation block with a
+ * branch back to its own start, so nothing outside it runs until it ends.
+ * An SPLOOPW whose condition never goes false would therefore hang the
+ * thread with no way to interrupt it. This is far above any real iteration
+ * count - the loops in question copy audio buffers - and turns that hang
+ * into something with a message on it.
+ */
+#define TIC6X_SPLOOP_MAX_PASSES (1u << 24)
 
 typedef struct CPUArchState {
     uint32_t gpr[TIC6X_NUM_GPR];

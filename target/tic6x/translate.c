@@ -27,6 +27,10 @@
  * selects between the new value and the old at writeback. Memory accesses
  * cannot be done that way and get a real branch.
  *
+ * SPLOOP is the fourth thing, and it is why the packet walk is split into a
+ * scan and an emit: a software-pipelined loop has to be generated as a
+ * whole, from a body the scanner reads ahead. See gen_sploop().
+ *
  * Instruction coverage is deliberately partial. Anything not implemented
  * traps by name, which is how the Blackfin's coverage was grown: run the
  * firmware, see what it stopped on, implement that, run again.
@@ -61,7 +65,73 @@ static TCGv_i32 cpu_br_target;
 static TCGv_i32 cpu_br_taken;
 static TCGv_i32 cpu_br_cnt;
 
-#define TIC6X_MAX_WB 8
+/*
+ * Results landing in one cycle. Eight functional units is the architectural
+ * limit for one execute packet, but a cycle inside an SPLOOP holds several
+ * stages at once, plus the address writebacks of their .D units and the
+ * loads arriving from four cycles earlier.
+ */
+#define TIC6X_MAX_WB 32
+
+/* An execute packet is eight instructions, but a compact one may be split
+   across a header packet's fourteen slots; this is room to spare. */
+#define TIC6X_MAX_PACKET 16
+
+/*
+ * A load's data lands four cycles after it issues - SPRUFE8B table 3-8,
+ * "Load: delay slots 4, write cycles i, i + 4", the i write being the
+ * address post-increment on a separate port.
+ *
+ * Everywhere else in this model a load writes its destination immediately,
+ * which is harmless because compiled code respects the delay slots. Inside
+ * an SPLOOP it is not harmless at all: the body is one iteration and the
+ * same register serves every pass, so with ii = 2 the value the store at
+ * body cycle 5 wants is the one loaded by ITS OWN iteration five cycles
+ * back, not the one issued a cycle ago by the iteration two ahead. Writing
+ * early scrambles the copy and says nothing about it.
+ */
+#define SP_LOAD_DELAY 4
+
+/* The loop buffer holds a body of at most 48 cycles - SPRUFE8B 7.7.3.3. */
+#define SP_MAX_CYCLES 48
+#define SP_MAX_STAGES (SP_MAX_CYCLES + SP_LOAD_DELAY)
+
+/* Two .D units per cycle, and a doubleword load writes a register pair. */
+#define SP_LOADS_PER_CYCLE 4
+
+/* One instruction, decoded. */
+typedef struct {
+    uint32_t insn;
+    uint32_t pc;
+    int bits;
+    const TIC6XOpcode *op;
+    const TIC6XFormat *fmt;
+} DisasInsn;
+
+/* One execute packet, decoded but not yet translated. */
+typedef struct {
+    uint32_t addr;              /* where it starts                        */
+    uint32_t pce1;              /* the fetch packet it starts in          */
+    uint32_t next;              /* the packet after it                    */
+    int cycles;                 /* what it costs, NOP n included          */
+    int n;
+    bool present;
+    DisasInsn ins[TIC6X_MAX_PACKET];
+} DisasPacket;
+
+/*
+ * A load in an SPLOOP body: the value waits here for the four cycles it
+ * takes to arrive. slot 0 is written when the load issues and the slots
+ * shift along once per pass, so the commit reads slot[depth] - the value
+ * from the pass that issued it, however many passes ago that was.
+ */
+typedef struct {
+    bool present;
+    int reg;                    /* what it writes                         */
+    int depth;                  /* passes between issuing and landing     */
+    TCGv_i32 val[SP_LOAD_DELAY + 1];
+    TCGv_i32 valid[SP_LOAD_DELAY + 1];
+} SPLoad;
 
 typedef struct DisasContext {
     DisasContextBase base;
@@ -112,6 +182,30 @@ typedef struct DisasContext {
      * 0x11804838.
      */
     uint32_t insn_pc;
+
+    /*
+     * An SPLOOP seen in the packet being translated. It cannot act where it
+     * is decoded: its own execute packet has to finish first, because
+     * SPLOOPD's iteration count arrives from an MVC in parallel with it and
+     * the loop reads that count afterwards. So the decode records it and
+     * the packet walk generates the loop once the writebacks are done.
+     */
+    struct {
+        bool active;
+        uint16_t mnem;
+        uint32_t insn;
+        int ii;
+        uint32_t creg, z;
+    } sp_start;
+
+    /* State while the body of an SPLOOP is being emitted. */
+    struct {
+        bool active;
+        TCGv_i32 gate;          /* is this stage running an iteration?    */
+        int bc;                 /* the body cycle being emitted           */
+        int nld;                /* loads emitted so far in that cycle     */
+        SPLoad *ld;             /* SP_LOADS_PER_CYCLE entries per cycle   */
+    } sp;
 } DisasContext;
 
 static void wb_add(DisasContext *dc, int reg, TCGv_i32 val)
@@ -196,27 +290,40 @@ static const TIC6XOpcode *decode(uint32_t insn, int bits, uint32_t expansion,
 
 /* --------------------------------------------------------- predication */
 
+/* Which register each creg value names; -1 for none and for the reserved 7. */
+static const int creg_reg[8] = {
+    -1,
+    TIC6X_REG_B(0), TIC6X_REG_B(1), TIC6X_REG_B(2),
+    TIC6X_REG_A(1), TIC6X_REG_A(2), TIC6X_REG_A(0),
+    -1,
+};
+
 /*
  * creg selects the predicate register and z the sense. Value 0 means the
  * instruction is unconditional, and 7 is reserved - the decoder rejects it,
  * so anything reaching here is one of the six real ones.
+ *
+ * Inside an SPLOOP body there is a second condition: whether the stage this
+ * instruction belongs to is running an iteration at all. It is one more
+ * term on the predicate the instruction already has, which is the whole
+ * reason the loop can be generated as ordinary translated code.
  */
-static TCGv_i32 insn_pred(uint32_t creg, uint32_t z)
+static TCGv_i32 insn_pred(DisasContext *dc, uint32_t creg, uint32_t z)
 {
-    static const int creg_reg[8] = {
-        -1,
-        TIC6X_REG_B(0), TIC6X_REG_B(1), TIC6X_REG_B(2),
-        TIC6X_REG_A(1), TIC6X_REG_A(2), TIC6X_REG_A(0),
-        -1,
-    };
-    TCGv_i32 pred;
+    TCGv_i32 pred = NULL;
 
-    if (creg == 0 || creg_reg[creg] < 0) {
-        return NULL;
+    if (creg != 0 && creg_reg[creg] >= 0) {
+        pred = tcg_temp_new_i32();
+        tcg_gen_setcondi_i32(z ? TCG_COND_EQ : TCG_COND_NE, pred,
+                             cpu_gpr[creg_reg[creg]], 0);
     }
-    pred = tcg_temp_new_i32();
-    tcg_gen_setcondi_i32(z ? TCG_COND_EQ : TCG_COND_NE, pred,
-                         cpu_gpr[creg_reg[creg]], 0);
+    if (dc->sp.gate) {
+        if (!pred) {
+            /* Read only from here on; nothing modifies a predicate. */
+            return dc->sp.gate;
+        }
+        tcg_gen_and_i32(pred, pred, dc->sp.gate);
+    }
     return pred;
 }
 
@@ -363,6 +470,60 @@ static TCGv_i32 src1_value(const TIC6XFormat *f, const TIC6XOpcode *op,
     return v;
 }
 
+/*
+ * The register a doubleword load or store names.
+ *
+ * Which field holds it, and how, is not the same across the forms. The
+ * aligned LDDW puts the even register number straight into srcdst; the
+ * nonaligned LDNDW puts the PAIR number - the register number halved, which
+ * is binutils' reg_shift - into dst, and STNDW into src. Reading srcdst
+ * unconditionally finds no such field in the nonaligned forms, so every one
+ * of them loads or stores A1:A0 and says nothing about it.
+ */
+static int dword_reg(const TIC6XFormat *f, const TIC6XOpcode *op,
+                     uint32_t insn, uint32_t side, bool high)
+{
+    static const TIC6XField cand[] = {
+        TIC6X_FLD_srcdst, TIC6X_FLD_dst, TIC6X_FLD_src,
+    };
+    uint32_t num = 0;
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(cand); i++) {
+        uint8_t enc = op->enc[cand[i]];
+
+        if (!field_present(f, cand[i]) ||
+            (enc != TIC6X_ENC_REG && enc != TIC6X_ENC_REG_SHIFT)) {
+            continue;
+        }
+        num = field_get(f, cand[i], insn);
+        if (enc == TIC6X_ENC_REG_SHIFT) {
+            num <<= 1;
+        }
+        break;
+    }
+    /* The pair is written A5:A4 and the even register holds the low half. */
+    return reg_of(side, high ? ((num & ~1u) | 1u) : (num & ~1u));
+}
+
+/*
+ * Whether addr_mode() can read this encoding at all.
+ *
+ * The compact memory instructions are a different addressing family: they
+ * name their pointer in ptr rather than baseR, their offset in cst, their
+ * register file in t, and they carry the mode in the fetch packet header's
+ * expansion bits rather than in a mode field. addr_mode() reads none of
+ * those, so for a compact form every field it wants is absent and it builds
+ * an address out of zeroes - a load from 0 that this machine answers with a
+ * quiet nothing. There are 286 of them in this image; they need their own
+ * decode, and until then they say so rather than pretend.
+ */
+static bool addr_mode_known(const TIC6XFormat *f)
+{
+    return field_present(f, TIC6X_FLD_mode) &&
+           field_present(f, TIC6X_FLD_baseR);
+}
+
 /* The addressing modes of the .D unit load and store, SPRUFE8B 3.8. */
 static TCGv_i32 addr_mode(DisasContext *dc, TCGv_i32 pred,
                           const TIC6XFormat *f, uint32_t insn, int scale)
@@ -411,12 +572,60 @@ static TCGv_i32 addr_mode(DisasContext *dc, TCGv_i32 pred,
     return addr;
 }
 
+/*
+ * The next delay-line slot for a load in an SPLOOP body. The slots were
+ * allocated by a scan of the same packets in the same order, so the nth
+ * load emitted from a body cycle is the nth the scan found there.
+ */
+static SPLoad *sp_load_slot(DisasContext *dc, int reg)
+{
+    SPLoad *l;
+
+    if (dc->sp.nld >= SP_LOADS_PER_CYCLE) {
+        return NULL;
+    }
+    l = &dc->sp.ld[dc->sp.bc * SP_LOADS_PER_CYCLE + dc->sp.nld++];
+    if (!l->present || l->reg != reg) {
+        return NULL;
+    }
+    return l;
+}
+
 static void gen_load(DisasContext *dc, TCGv_i32 pred, int dst,
                      TCGv_i32 addr, MemOp op)
 {
-    TCGv_i32 val = tcg_temp_new_i32();
+    TCGv_i32 val;
     TCGLabel *skip = NULL;
 
+    if (dc->sp.active) {
+        /*
+         * In a loop body the value does not go to the register here. It is
+         * four cycles in the air; gen_sploop() lands it at the cycle where
+         * the architecture says it becomes readable.
+         */
+        SPLoad *l = sp_load_slot(dc, dst);
+
+        if (l) {
+            tcg_gen_movi_i32(l->valid[0], 0);
+            if (pred) {
+                skip = gen_new_label();
+                tcg_gen_brcondi_i32(TCG_COND_EQ, pred, 0, skip);
+            }
+            tcg_gen_qemu_ld_i32(l->val[0], addr, 0, op);
+            tcg_gen_movi_i32(l->valid[0], 1);
+            if (skip) {
+                gen_set_label(skip);
+            }
+            return;
+        }
+        /* The scan and the emit disagree, which they cannot; say so rather
+           than write to the wrong register. */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "tic6x: load at 0x%08x has no delay slot in the "
+                      "SPLOOP body\n", dc->insn_pc);
+    }
+
+    val = tcg_temp_new_i32();
     if (pred) {
         skip = gen_new_label();
         tcg_gen_brcondi_i32(TCG_COND_EQ, pred, 0, skip);
@@ -444,31 +653,64 @@ static void gen_store(DisasContext *dc, TCGv_i32 pred, int src,
 }
 
 /*
- * Translate one instruction of an execute packet. Returns the number of
- * cycles it occupies, which is one for everything except NOP n - and that
- * matters, because those cycles are what a branch's delay slots are counted
- * in.
+ * How many cycles an instruction occupies. One for everything except the
+ * multicycle NOPs, and that matters twice over: those cycles are what a
+ * branch's delay slots are counted in, and what an SPLOOP body's stage
+ * boundaries are measured in.
+ *
+ * The count lives in a different field in each encoding and is stored one
+ * less than it means - binutils' ucst_minus_one. Reading a field the format
+ * does not have, which is what this used to do, makes every NOP n a NOP 1.
  */
-static int trans_one(DisasContext *dc, uint32_t insn, int bits,
-                     uint32_t expansion)
+static int insn_cycles(const TIC6XOpcode *op, const TIC6XFormat *f,
+                       uint32_t insn)
 {
-    const TIC6XFormat *f;
-    const TIC6XOpcode *op = decode(insn, bits, expansion, &f);
+    switch (op->mnem) {
+    case TIC6X_MNEM_nop:
+        /* op in the 32-bit form, n in the compact one. */
+        if (field_present(f, TIC6X_FLD_op)) {
+            return field_get(f, TIC6X_FLD_op, insn) + 1;
+        }
+        if (field_present(f, TIC6X_FLD_n)) {
+            return field_get(f, TIC6X_FLD_n, insn) + 1;
+        }
+        return 1;
+
+    case TIC6X_MNEM_addkpc:
+        /* dst = return address, then src2 cycles of nop. */
+        return field_present(f, TIC6X_FLD_src2)
+               ? field_get(f, TIC6X_FLD_src2, insn) + 1 : 1;
+
+    case TIC6X_MNEM_bnop:
+        /* A branch carrying the nops that fill its own delay slots. */
+        return field_present(f, TIC6X_FLD_n)
+               ? field_get(f, TIC6X_FLD_n, insn) + 1 : 1;
+
+    default:
+        return 1;
+    }
+}
+
+/* Translate one instruction of an execute packet. */
+static void trans_one(DisasContext *dc, const DisasInsn *di)
+{
+    uint32_t insn = di->insn;
+    const TIC6XFormat *f = di->fmt;
+    const TIC6XOpcode *op = di->op;
     TCGv_i32 pred;
     uint32_t creg = 0, z = 0, s, x;
-    int cycles = 1;
 
     if (!op) {
         tcg_gen_movi_i32(cpu_pc, dc->insn_pc);
         gen_helper_illegal(tcg_env, tcg_constant_i32(insn));
-        return 1;
+        return;
     }
 
     if (field_present(f, TIC6X_FLD_creg)) {
         creg = field_get(f, TIC6X_FLD_creg, insn);
         z = field_get(f, TIC6X_FLD_z, insn);
     }
-    pred = insn_pred(creg, z);
+    pred = insn_pred(dc, creg, z);
     s = field_present(f, TIC6X_FLD_s) ? field_get(f, TIC6X_FLD_s, insn) : 0;
     x = field_present(f, TIC6X_FLD_x) ? field_get(f, TIC6X_FLD_x, insn) : 0;
 
@@ -486,7 +728,7 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
         gen_helper_alu2(v, tcg_env, tcg_constant_i32(op->mnem), a,
                         cpu_gpr[src2]);
         wb_pred(dc, pred, dst, v);
-        return cycles;
+        return;
     }
     if (routed_alu2_wide(op->mnem)) {
         uint32_t dstn = field_get(f, TIC6X_FLD_dst, insn);
@@ -497,7 +739,7 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
         gen_helper_alu2_wide(v, tcg_env, tcg_constant_i32(op->mnem), a,
                              cpu_gpr[src2]);
         pair_set(dc, pred, s, dstn, v);
-        return cycles;
+        return;
     }
 
     switch (op->mnem) {
@@ -613,17 +855,9 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
         break;
     }
 
-    case TIC6X_MNEM_nop: {
-        /*
-         * NOP n idles for n cycles. Nothing here models cycles, but the
-         * count still has to be honoured because branch delay slots are
-         * measured in them: a NOP 5 in a delay slot fills all five.
-         */
-        uint32_t src = field_present(f, TIC6X_FLD_src) ?
-                       field_get(f, TIC6X_FLD_src, insn) : 0;
-        cycles = src + 1;
+    case TIC6X_MNEM_nop:
+        /* Its only effect is the cycles it eats, counted by insn_cycles(). */
         break;
-    }
 
     case TIC6X_MNEM_mvk: {
         /* Sign-extended 16-bit constant into a register. */
@@ -722,8 +956,12 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
                    op->mnem == TIC6X_MNEM_ldh ? MO_LESW :
                    op->mnem == TIC6X_MNEM_ldhu ? MO_LEUW :
                    op->mnem == TIC6X_MNEM_ldb ? MO_SB : MO_UB;
-        TCGv_i32 addr = addr_mode(dc, pred, f, insn, scale);
+        TCGv_i32 addr;
 
+        if (!addr_mode_known(f)) {
+            goto unimplemented;
+        }
+        addr = addr_mode(dc, pred, f, insn, scale);
         gen_load(dc, pred, dst, addr, mo);
         break;
     }
@@ -737,8 +975,12 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
                     op->mnem == TIC6X_MNEM_sth ? 1 : 0;
         MemOp mo = op->mnem == TIC6X_MNEM_stw ? MO_LEUL :
                    op->mnem == TIC6X_MNEM_sth ? MO_LEUW : MO_UB;
-        TCGv_i32 addr = addr_mode(dc, pred, f, insn, scale);
+        TCGv_i32 addr;
 
+        if (!addr_mode_known(f)) {
+            goto unimplemented;
+        }
+        addr = addr_mode(dc, pred, f, insn, scale);
         gen_store(dc, pred, src, addr, mo);
         break;
     }
@@ -880,12 +1122,10 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
          */
         int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
         int32_t disp = (int32_t)(field_get(f, TIC6X_FLD_src1, insn) << 25) >> 25;
-        uint32_t nops = field_get(f, TIC6X_FLD_src2, insn);
         TCGv_i32 v = tcg_temp_new_i32();
 
         tcg_gen_movi_i32(v, dc->pce1 + (disp << 2));
         wb_pred(dc, pred, dst, v);
-        cycles = nops + 1;
         break;
     }
 
@@ -939,27 +1179,32 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
         bool is_load = op->mnem == TIC6X_MNEM_lddw ||
                        op->mnem == TIC6X_MNEM_ldndw;
         uint32_t side = field_get(f, TIC6X_FLD_s, insn);
-        uint32_t num = field_get(f, TIC6X_FLD_srcdst, insn);
-        int lo = reg_of(side, num & ~1u);
-        int hi = reg_of(side, (num & ~1u) | 1u);
-        TCGv_i32 addr = addr_mode(dc, pred, f, insn, 3);
-        TCGv_i32 hiaddr = tcg_temp_new_i32();
-        TCGLabel *skip = NULL;
+        int lo = dword_reg(f, op, insn, side, false);
+        int hi = dword_reg(f, op, insn, side, true);
+        /*
+         * The nonaligned forms carry an sc bit saying whether the offset is
+         * scaled by the access size or taken as bytes - SPRUFE8B's LDNDW
+         * page, "if sc is 0 the offsetR/ucst5 is not shifted". The aligned
+         * ones always scale.
+         */
+        int scale = field_present(f, TIC6X_FLD_sc)
+                    ? (field_get(f, TIC6X_FLD_sc, insn) ? 3 : 0) : 3;
+        TCGv_i32 addr, hiaddr;
 
+        if (!addr_mode_known(f)) {
+            goto unimplemented;
+        }
+        addr = addr_mode(dc, pred, f, insn, scale);
+        hiaddr = tcg_temp_new_i32();
         tcg_gen_addi_i32(hiaddr, addr, 4);
-        if (pred) {
-            skip = gen_new_label();
-            tcg_gen_brcondi_i32(TCG_COND_EQ, pred, 0, skip);
-        }
+        /* Two word accesses rather than one inline pair, so that a load in
+           an SPLOOP body reaches its delay line like any other. */
         if (is_load) {
-            tcg_gen_qemu_ld_i32(cpu_gpr[lo], addr, 0, MO_LEUL);
-            tcg_gen_qemu_ld_i32(cpu_gpr[hi], hiaddr, 0, MO_LEUL);
+            gen_load(dc, pred, lo, addr, MO_LEUL);
+            gen_load(dc, pred, hi, hiaddr, MO_LEUL);
         } else {
-            tcg_gen_qemu_st_i32(cpu_gpr[lo], addr, 0, MO_LEUL);
-            tcg_gen_qemu_st_i32(cpu_gpr[hi], hiaddr, 0, MO_LEUL);
-        }
-        if (skip) {
-            gen_set_label(skip);
+            gen_store(dc, pred, lo, addr, MO_LEUL);
+            gen_store(dc, pred, hi, hiaddr, MO_LEUL);
         }
         break;
     }
@@ -977,18 +1222,10 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
         int hi = reg_of(s, (num & ~1u) | 1u);
         int base = reg_of(s, field_get(f, TIC6X_FLD_src2, insn));
         TCGv_i32 hiaddr = tcg_temp_new_i32();
-        TCGLabel *skip = NULL;
 
         tcg_gen_addi_i32(hiaddr, cpu_gpr[base], 4);
-        if (pred) {
-            skip = gen_new_label();
-            tcg_gen_brcondi_i32(TCG_COND_EQ, pred, 0, skip);
-        }
-        tcg_gen_qemu_ld_i32(cpu_gpr[lo], cpu_gpr[base], 0, MO_LEUL);
-        tcg_gen_qemu_ld_i32(cpu_gpr[hi], hiaddr, 0, MO_LEUL);
-        if (skip) {
-            gen_set_label(skip);
-        }
+        gen_load(dc, pred, lo, cpu_gpr[base], MO_LEUL);
+        gen_load(dc, pred, hi, hiaddr, MO_LEUL);
         break;
     }
 
@@ -998,8 +1235,12 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
            fault on alignment. */
         int reg = reg_of(field_get(f, TIC6X_FLD_s, insn),
                          field_get(f, TIC6X_FLD_srcdst, insn));
-        TCGv_i32 addr = addr_mode(dc, pred, f, insn, 2);
+        TCGv_i32 addr;
 
+        if (!addr_mode_known(f)) {
+            goto unimplemented;
+        }
+        addr = addr_mode(dc, pred, f, insn, 2);
         if (op->mnem == TIC6X_MNEM_ldnw) {
             gen_load(dc, pred, reg, addr, MO_LEUL);
         } else {
@@ -1310,36 +1551,38 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
         break;
     }
 
-    case TIC6X_MNEM_spmask:
-    case TIC6X_MNEM_spmaskr:
-    case TIC6X_MNEM_spkernel:
-    case TIC6X_MNEM_spkernelr:
     case TIC6X_MNEM_sploop:
     case TIC6X_MNEM_sploopd:
     case TIC6X_MNEM_sploopw: {
         /*
-         * The software-pipelined loop buffer, and the one thing here that is
-         * deliberately left unimplemented rather than approximated.
-         *
-         * SPLOOP does not mean "run this body ILC times". It loads the body
-         * into a buffer and replays it with a different set of stages active
-         * each iteration, so several iterations are in flight at once and an
-         * instruction's neighbours differ from one pass to the next. SPMASK
-         * then suppresses individual units within that. Executing the body
-         * serially gives the right answer only for loops that happen not to
-         * depend on the overlap, and the compiler emits SPLOOP precisely
-         * when it does depend on it.
-         *
-         * A wrong answer here would be wrong audio samples, quietly - the
-         * failure mode this model has been careful to avoid everywhere else.
-         * So it traps, and doing it properly means modelling the buffer and
-         * its stage predicates. 87 instructions in this firmware use it.
+         * Record it and let the packet walk act on it. The loop cannot be
+         * generated here: SPLOOPD takes its iteration count from an MVC in
+         * parallel with it, so the count is only in ILC once this execute
+         * packet's writebacks have landed. See gen_sploop().
          */
-        tcg_gen_movi_i32(cpu_pc, dc->insn_pc);
-        gen_helper_unimplemented(tcg_env, tcg_constant_i32(insn),
-                                 tcg_constant_i32(op->mnem));
+        uint32_t ii_field = field_present(f, TIC6X_FLD_cstb)
+                            ? TIC6X_FLD_cstb : TIC6X_FLD_ii;
+
+        dc->sp_start.active = true;
+        dc->sp_start.mnem = op->mnem;
+        dc->sp_start.insn = insn;
+        /* ii is encoded one less than it means. */
+        dc->sp_start.ii = field_get(f, ii_field, insn) + 1;
+        dc->sp_start.creg = creg;
+        dc->sp_start.z = z;
         break;
     }
+
+    case TIC6X_MNEM_spmask:
+    case TIC6X_MNEM_spmaskr:
+    case TIC6X_MNEM_spkernel:
+    case TIC6X_MNEM_spkernelr:
+        /*
+         * These say things about the loop buffer rather than doing anything
+         * to the register file, and gen_sploop() has already read what they
+         * say. Outside a loop body SPRUFE8B has them do nothing.
+         */
+        break;
 
     case TIC6X_MNEM_bnop:
     case TIC6X_MNEM_b: {
@@ -1380,32 +1623,48 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
         }
         dc->br_countdown = TIC6X_BRANCH_DELAY;
         dc->br_just_set = true;
-        /*
-         * BNOP is a branch with its own nop count, which fills some of the
-         * delay slots the branch just opened. The count has to be honoured
-         * for the same reason NOP n does: the slots are counted in cycles.
-         */
-        if (op->mnem == TIC6X_MNEM_bnop && field_present(f, TIC6X_FLD_n)) {
-            cycles = field_get(f, TIC6X_FLD_n, insn) + 1;
-        }
         break;
     }
 
     default:
+    unimplemented:
         tcg_gen_movi_i32(cpu_pc, dc->insn_pc);
         gen_helper_unimplemented(tcg_env, tcg_constant_i32(insn),
                                  tcg_constant_i32(op->mnem));
         break;
     }
-
-    return cycles;
 }
 
 /* ---------------------------------------------------------- the packet */
 
+/* Decode one instruction into a packet, and let it claim its cycles. */
+static void scan_one(DisasPacket *pk, uint32_t insn, int bits,
+                     uint32_t expansion, uint32_t pc)
+{
+    DisasInsn *di;
+
+    if (pk->n >= TIC6X_MAX_PACKET) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "tic6x: more than %d instructions in the execute "
+                      "packet at 0x%08x\n", TIC6X_MAX_PACKET, pk->addr);
+        return;
+    }
+    di = &pk->ins[pk->n++];
+    di->insn = insn;
+    di->bits = bits;
+    di->pc = pc;
+    di->op = decode(insn, bits, expansion, &di->fmt);
+    if (di->op) {
+        int c = insn_cycles(di->op, di->fmt, insn);
+
+        if (c > pk->cycles) {
+            pk->cycles = c;
+        }
+    }
+}
+
 /*
- * Translate one execute packet, and return how many bytes of instruction
- * stream it consumed and how many cycles it took.
+ * Read one execute packet and decode it, without emitting anything.
  *
  * A fetch packet is eight words on a 32-byte boundary. If its last word has
  * bits 31-28 set to 1110 it is a header rather than an instruction, and the
@@ -1424,19 +1683,24 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
  *
  * An execute packet is at most eight instructions, so it can span at most
  * two fetch packets; going further means the walk has lost its place.
+ *
+ * Reading and translating are separate because an SPLOOP body has to be read
+ * ahead in full before any of it can be generated, and doing that with a
+ * second copy of this walk would mean two chances to get the p-bits wrong.
  */
-static int translate_packet(CPUState *cs, DisasContext *dc, uint32_t pc,
-                            int *cycles)
+static void scan_packet(CPUState *cs, DisasContext *dc, uint32_t pc,
+                        DisasPacket *pk)
 {
     uint32_t fp_base = pc & ~31u;
     int consumed = 0;
     int fetch_packets = 0;
     bool ended = false;
 
-    dc->packet_pc = pc;
-    dc->pce1 = fp_base;
-    dc->nwb = 0;
-    *cycles = 1;
+    memset(pk, 0, sizeof(*pk));
+    pk->addr = pc;
+    pk->pce1 = fp_base;
+    pk->cycles = 1;
+    pk->present = true;
 
     while (!ended) {
         uint32_t word[8];
@@ -1448,7 +1712,7 @@ static int translate_packet(CPUState *cs, DisasContext *dc, uint32_t pc,
         if (++fetch_packets > 2) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "tic6x: execute packet at 0x%08x spans more than "
-                          "two fetch packets\n", dc->packet_pc);
+                          "two fetch packets\n", pk->addr);
             break;
         }
 
@@ -1506,20 +1770,15 @@ static int translate_packet(CPUState *cs, DisasContext *dc, uint32_t pc,
 
                 for (h = 0; h < halves; h++) {
                     bool parallel;
-                    int c;
 
-                    dc->insn_pc = fp_base + i * 4;
                     if (compact) {
                         uint32_t op16 = h ? (w >> 16) : (w & 0xffff);
 
-                        c = trans_one(dc, op16, 16, expansion);
+                        scan_one(pk, op16, 16, expansion, fp_base + i * 4);
                         parallel = pbits & (1u << (2 * i + h));
                     } else {
-                        c = trans_one(dc, w, 32, 0);
+                        scan_one(pk, w, 32, 0, fp_base + i * 4);
                         parallel = w & 1;
-                    }
-                    if (c > *cycles) {
-                        *cycles = c;
                     }
                     if (!parallel) {
                         consumed += (i - slot) * 4 + 4;
@@ -1535,14 +1794,8 @@ static int translate_packet(CPUState *cs, DisasContext *dc, uint32_t pc,
         } else {
             for (n = slot; n < 8; n++) {
                 uint32_t w = word[n];
-                int c;
 
-                dc->insn_pc = fp_base + n * 4;
-                c = trans_one(dc, w, 32, 0);
-
-                if (c > *cycles) {
-                    *cycles = c;
-                }
+                scan_one(pk, w, 32, 0, fp_base + n * 4);
                 if (!(w & 1)) {
                     consumed += (n - slot) * 4 + 4;
                     ended = true;
@@ -1557,8 +1810,584 @@ static int translate_packet(CPUState *cs, DisasContext *dc, uint32_t pc,
         /* Carry on into the next fetch packet if the packet did not end. */
         fp_base += 32;
     }
+    pk->next = pc + (consumed ? consumed : 4);
+}
+
+/* Translate every instruction of a scanned packet. The caller flushes. */
+static void emit_packet(DisasContext *dc, const DisasPacket *pk)
+{
+    int i;
+
+    dc->packet_pc = pk->addr;
+    dc->pce1 = pk->pce1;
+    for (i = 0; i < pk->n; i++) {
+        dc->insn_pc = pk->ins[i].pc;
+        trans_one(dc, &pk->ins[i]);
+    }
+}
+
+/* ---------------------------------------------------------- SPLOOP */
+
+/*
+ * The software-pipelined loop buffer, SPRUFE8B chapter 7.
+ *
+ * SPLOOP does not mean "run this body ILC times". The body is one iteration
+ * of a modulo-scheduled loop, divided into stages of ii cycles; iteration j
+ * starts ii cycles after iteration j-1, so several iterations are in flight
+ * at once and what executes alongside an instruction differs from one pass
+ * to the next. Running the body serially gives the steady state with no
+ * prolog and no epilog, and the compiler emits SPLOOP precisely when the
+ * overlap is what makes the loop correct.
+ *
+ * Stated as a schedule it is simple enough to generate directly. At absolute
+ * cycle t, the instructions that run are body cycle t - j*ii for every
+ * iteration j that has started and not finished. Group the cycles into
+ * passes of ii and that becomes: at pass p, offset c, stage k runs body
+ * cycle k*ii + c on behalf of iteration p - k. So one pass of generated code
+ * covers every stage, each gated on whether its iteration exists - which is
+ * one more term on the predicate every instruction already has. The pass
+ * repeats through a backward branch, and the whole loop is one translation
+ * block.
+ *
+ * Two things make that gating insufficient on its own.
+ *
+ * A load's data lands four cycles after it issues. The body reuses one
+ * register per iteration and only works because the value is consumed before
+ * the next one lands, so the four cycles have to be modelled: see SPLoad.
+ *
+ * SPMASK marks instructions that are executed but not loaded into the
+ * buffer, which is how setup code is overlaid on the loop's first stage.
+ * Those run for iteration 0 only - that is, at pass p == k - and they
+ * suppress anything from an older stage on the same unit in that cycle.
+ *
+ * What is not modelled, and would need to be if a firmware used it:
+ *
+ *   - reload, SPKERNELR and SPMASKR. Nothing in this image reloads.
+ *   - interrupts during a loop. Hardware pipes the loop down, takes the
+ *     interrupt, and pipes it back up; here the loop runs to completion
+ *     first. The DSP has no interrupts wired up yet either way.
+ *   - the SPKERNEL fstg/fcyc delay, which overlaps post-loop code with the
+ *     epilog. Here the epilog finishes first. That is safe in the direction
+ *     it errs: post-loop reads see final values rather than stale ones, and
+ *     post-loop writes land after the epilog's reads rather than before.
+ */
+
+/* How the eight bits of an SPMASK unit mask are ordered: L1 L2 S1 S2 D1 D2
+   M1 M2, SPRUFE8B figure H-8. The compact form has only the first six. */
+static bool sp_unit_masked(const DisasInsn *di, uint32_t mask)
+{
+    static const int8_t first[TIC6X_UNIT_COUNT] = {
+        [TIC6X_UNIT_l] = 0, [TIC6X_UNIT_s] = 2,
+        [TIC6X_UNIT_d] = 4, [TIC6X_UNIT_m] = 6,
+        [TIC6X_UNIT_nfu] = -1,
+    };
+    int base;
+    uint32_t side;
+
+    if (!di->op || di->op->unit >= TIC6X_UNIT_COUNT) {
+        return false;
+    }
+    base = first[di->op->unit];
+    if (base < 0) {
+        return false;
+    }
+    /*
+     * Which field says unit 1 or unit 2 is not always s. A load names its
+     * unit in y and its register file in s, so LDW .D1T2 has y = 0 and
+     * s = 1; masking on s would mask the wrong .D unit. The generator
+     * carries binutils' ENC(field, fu, ...) through for exactly this.
+     */
+    if (di->op->unit_field >= TIC6X_FLD_COUNT ||
+        !field_present(di->fmt, di->op->unit_field)) {
+        return false;
+    }
+    side = field_get(di->fmt, di->op->unit_field, di->insn) & 1;
+    return (mask >> (base + side)) & 1;
+}
+
+/* The registers a load writes, in the order gen_load() will be called for
+   them. Zero for anything that is not a load. */
+static int sp_load_regs(const DisasInsn *di, int *regs)
+{
+    const TIC6XFormat *f = di->fmt;
+    uint32_t insn = di->insn;
+    uint32_t side;
+
+    if (!di->op) {
+        return 0;
+    }
+    switch (di->op->mnem) {
+    case TIC6X_MNEM_ldw:
+    case TIC6X_MNEM_ldh:
+    case TIC6X_MNEM_ldhu:
+    case TIC6X_MNEM_ldb:
+    case TIC6X_MNEM_ldbu:
+    case TIC6X_MNEM_ldnw:
+        regs[0] = reg_of(field_get(f, TIC6X_FLD_s, insn),
+                         field_get(f, TIC6X_FLD_srcdst, insn));
+        return 1;
+
+    case TIC6X_MNEM_lddw:
+    case TIC6X_MNEM_ldndw:
+    case TIC6X_MNEM_cmtl:
+        side = field_present(f, TIC6X_FLD_s)
+               ? field_get(f, TIC6X_FLD_s, insn) : 0;
+        regs[0] = dword_reg(f, di->op, insn, side, false);
+        regs[1] = dword_reg(f, di->op, insn, side, true);
+        return 2;
+
+    default:
+        return 0;
+    }
+}
+
+/*
+ * Things a loop body may not contain, because the machinery around them
+ * assumes it is being driven one packet at a time. A branch would arm the
+ * delay-slot countdown from inside a loop that the countdown knows nothing
+ * about; a nested SPLOOP needs the second loop buffer this does not have.
+ * SPRUFE8B forbids most of these in a body anyway unless they are SPMASKed.
+ */
+static bool sp_body_forbids(uint16_t mnem)
+{
+    switch (mnem) {
+    case TIC6X_MNEM_b:
+    case TIC6X_MNEM_bnop:
+    case TIC6X_MNEM_bdec:
+    case TIC6X_MNEM_bpos:
+    case TIC6X_MNEM_callp:
+    case TIC6X_MNEM_addkpc:
+    case TIC6X_MNEM_sploop:
+    case TIC6X_MNEM_sploopd:
+    case TIC6X_MNEM_sploopw:
+    case TIC6X_MNEM_spkernelr:
+    case TIC6X_MNEM_spmaskr:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* A gate that also requires the pass number to match, or not to. */
+static TCGv_i32 sp_gate_pass(TCGv_i32 live, TCGv_i32 pass, int k, TCGCond c)
+{
+    TCGv_i32 g = tcg_temp_new_i32();
+
+    tcg_gen_setcondi_i32(c, g, pass, k);
+    tcg_gen_and_i32(g, g, live);
+    return g;
+}
+
+/* Stop before generating a loop that would be wrong, naming the reason. */
+static uint32_t sp_refuse(DisasContext *dc, uint32_t resume, uint32_t insn,
+                          uint16_t mnem)
+{
+    tcg_gen_movi_i32(cpu_pc, dc->packet_pc);
+    gen_helper_unimplemented(tcg_env, tcg_constant_i32(insn),
+                             tcg_constant_i32(mnem));
+    return resume;
+}
+
+/*
+ * Generate the whole loop, and return the address execution resumes at -
+ * the execute packet after the one holding SPKERNEL.
+ */
+static uint32_t gen_sploop(CPUState *cs, DisasContext *dc, uint32_t body_pc)
+{
+    const int ii = dc->sp_start.ii;
+    const uint16_t kind = dc->sp_start.mnem;
+    const uint32_t sp_insn = dc->sp_start.insn;
+    DisasPacket *body = NULL;
+    SPLoad *loads = NULL;
+    uint8_t *umask = NULL;
+    TCGv_i32 live[SP_MAX_STAGES];
+    TCGv_i32 wcond[SP_LOAD_DELAY + 1];
+    TCGv_i32 pass, go, any, iters = NULL;
+    TCGLabel *loop_top, *loop_done, *runaway;
+    int dynlen = 0, span, nstages, wdepth = 0, wsample = 0, wskip;
+    int bc, c, d, i, k, n;
+    uint32_t pc = body_pc, resume = body_pc;
+    bool found_kernel = false;
+
+    if (ii < 1 || ii > 14) {
+        return sp_refuse(dc, body_pc, sp_insn, kind);
+    }
+    if (kind == TIC6X_MNEM_sploopw && dc->sp_start.creg == 0) {
+        /* SPLOOPW takes its exit condition from its own predicate; without
+           one there is nothing to end the loop. SPRUFE8B 7.5.1.3. */
+        return sp_refuse(dc, body_pc, sp_insn, kind);
+    }
+    if (dc->br_countdown >= 0) {
+        qemu_log_mask(LOG_UNIMP,
+                      "tic6x: SPLOOP at 0x%08x inside a branch's delay "
+                      "slots; the loop's cycles are not counted\n",
+                      dc->packet_pc);
+    }
+
+    body = g_new0(DisasPacket, SP_MAX_CYCLES);
+    umask = g_new0(uint8_t, SP_MAX_CYCLES);
+    loads = g_new0(SPLoad, SP_MAX_CYCLES * SP_LOADS_PER_CYCLE);
+
+    /*
+     * Read the body: every execute packet from here to the one holding
+     * SPKERNEL, indexed by the cycle it starts on. dynlen counts execute
+     * packets and NOP cycles alike, starting with the cycle after the
+     * SPLOOP - SPRUFE8B 7.7.
+     */
+    while (dynlen < SP_MAX_CYCLES) {
+        DisasPacket *b = &body[dynlen];
+
+        scan_packet(cs, dc, pc, b);
+        pc = b->next;
+        for (i = 0; i < b->n; i++) {
+            const DisasInsn *di = &b->ins[i];
+
+            if (!di->op) {
+                continue;
+            }
+            if (di->op->mnem == TIC6X_MNEM_spkernel ||
+                di->op->mnem == TIC6X_MNEM_spkernelr) {
+                found_kernel = true;
+            } else if (di->op->mnem == TIC6X_MNEM_spmask ||
+                       di->op->mnem == TIC6X_MNEM_spmaskr) {
+                umask[dynlen] |= field_present(di->fmt, TIC6X_FLD_mask)
+                                 ? field_get(di->fmt, TIC6X_FLD_mask, di->insn)
+                                 : 0;
+            } else if (sp_body_forbids(di->op->mnem)) {
+                resume = sp_refuse(dc, pc, di->insn, di->op->mnem);
+                goto out;
+            }
+        }
+        dynlen += b->cycles;
+        if (found_kernel) {
+            break;
+        }
+    }
+    resume = pc;
+    if (!found_kernel) {
+        /* Forty-eight cycles with no SPKERNEL is not a loop body. */
+        resume = sp_refuse(dc, pc, sp_insn, kind);
+        goto out;
+    }
+
+    /*
+     * Loads issued in the last stages land after the body has ended, so the
+     * pipeline has to run on past dynlen far enough for them to arrive.
+     */
+    span = dynlen;
+    for (bc = 0; bc < dynlen; bc++) {
+        if (!body[bc].present) {
+            continue;
+        }
+        n = 0;
+        for (i = 0; i < body[bc].n; i++) {
+            int regs[2];
+            int nr = sp_load_regs(&body[bc].ins[i], regs);
+
+            for (d = 0; d < nr; d++) {
+                SPLoad *l;
+
+                if (n >= SP_LOADS_PER_CYCLE) {
+                    resume = sp_refuse(dc, resume, body[bc].ins[i].insn,
+                                       body[bc].ins[i].op->mnem);
+                    goto out;
+                }
+                l = &loads[bc * SP_LOADS_PER_CYCLE + n++];
+                l->present = true;
+                l->reg = regs[d];
+                l->depth = (bc + SP_LOAD_DELAY) / ii - bc / ii;
+            }
+            if (nr && bc + SP_LOAD_DELAY + 1 > span) {
+                span = bc + SP_LOAD_DELAY + 1;
+            }
+        }
+    }
+    nstages = (span + ii - 1) / ii;
+    if (nstages > SP_MAX_STAGES) {
+        resume = sp_refuse(dc, resume, sp_insn, kind);
+        goto out;
+    }
+
+    /* ---- the loop's state, all of it temporaries of this block ---- */
+
+    for (bc = 0; bc < dynlen; bc++) {
+        for (n = 0; n < SP_LOADS_PER_CYCLE; n++) {
+            SPLoad *l = &loads[bc * SP_LOADS_PER_CYCLE + n];
+
+            if (!l->present) {
+                continue;
+            }
+            for (d = 0; d <= l->depth; d++) {
+                l->val[d] = tcg_temp_new_i32();
+                l->valid[d] = tcg_temp_new_i32();
+                tcg_gen_movi_i32(l->val[d], 0);
+                tcg_gen_movi_i32(l->valid[d], 0);
+            }
+        }
+    }
+
+    pass = tcg_temp_new_i32();
+    go = tcg_temp_new_i32();
+    any = tcg_temp_new_i32();
+    tcg_gen_movi_i32(pass, 0);
+    for (k = 0; k < nstages; k++) {
+        live[k] = tcg_temp_new_i32();
+        tcg_gen_movi_i32(live[k], 0);
+    }
+
+    /*
+     * How many iterations, and when a new one stops starting.
+     *
+     * SPLOOP tests ILC at the instruction itself and at every stage
+     * boundary, terminating when it reaches zero and decrementing otherwise,
+     * which comes to exactly ILC iterations - zero of them if ILC is zero
+     * (SPRUFE8B 7.9.1, 7.9.2).
+     *
+     * SPLOOPD skips both the initial test and every stage boundary in the
+     * first three cycles, so it runs 1 + 3/ii iterations before ILC is
+     * consulted at all. That reproduces table 7-4's minimum counts - four
+     * for ii = 1, two for ii = 2 and 3, one above that - and the bias the
+     * assembler applies when loading ILC.
+     *
+     * SPLOOPW has no count: it runs while its own predicate holds, sampled
+     * four cycles before each stage boundary (7.10.2), with the same first
+     * three cycles exempt.
+     */
+    wskip = 3 / ii;
+    switch (kind) {
+    case TIC6X_MNEM_sploop:
+    case TIC6X_MNEM_sploopd:
+        iters = tcg_temp_new_i32();
+        tcg_gen_ld_i32(iters, tcg_env,
+                       offsetof(CPUTIC6XState, cr[TIC6X_CR_ILC]));
+        if (kind == TIC6X_MNEM_sploopd) {
+            tcg_gen_addi_i32(iters, iters, 1 + wskip);
+        }
+        tcg_gen_setcond_i32(TCG_COND_LTU, go, pass, iters);
+        break;
+
+    default:                    /* sploopw */
+        /*
+         * The condition is read four cycles before the stage boundary that
+         * acts on it, so it is sampled at whichever offset of an earlier
+         * pass is four cycles back: wdepth passes and wsample cycles into
+         * one. With ii >= 4 that is the pass just gone; with ii = 1 it is
+         * four passes ago, which is why this is a shift register at all.
+         *
+         * Sampling at offset wsample of pass q lands in wcond[0], so at the
+         * end of pass q - deciding the boundary before pass q + 1 at cycle
+         * (q + 1) * ii - the wanted sample is the one from pass
+         * q + 1 - wdepth, which is wcond[wdepth - 1].
+         */
+        wdepth = (SP_LOAD_DELAY + ii - 1) / ii;
+        wsample = wdepth * ii - SP_LOAD_DELAY;
+        for (d = 0; d < wdepth; d++) {
+            wcond[d] = tcg_temp_new_i32();
+            tcg_gen_movi_i32(wcond[d], 1);
+        }
+        tcg_gen_movi_i32(go, 1);
+        break;
+    }
+
+    /* ---- one pass over the body ---- */
+
+    loop_top = gen_new_label();
+    loop_done = gen_new_label();
+    runaway = gen_new_label();
+
+    dc->sp.active = true;
+    dc->sp.ld = loads;
+
+    gen_set_label(loop_top);
+
+    /* The stage window slides by one: what stage k held is now stage k+1,
+       and the iteration starting this pass, if there is one, enters at 0. */
+    for (k = nstages - 1; k >= 1; k--) {
+        tcg_gen_mov_i32(live[k], live[k - 1]);
+    }
+    tcg_gen_mov_i32(live[0], go);
+
+    /* Nothing in flight and nothing starting: the loop has drained. */
+    tcg_gen_mov_i32(any, live[0]);
+    for (k = 1; k < nstages; k++) {
+        tcg_gen_or_i32(any, any, live[k]);
+    }
+    tcg_gen_brcondi_i32(TCG_COND_EQ, any, 0, loop_done);
+
+    for (c = 0; c < ii; c++) {
+        dc->nwb = 0;
+
+        /* SPLOOPW reads its condition here, four cycles before the stage
+           boundary that will act on it. */
+        if (kind == TIC6X_MNEM_sploopw && c == wsample) {
+            int reg = creg_reg[dc->sp_start.creg];
+
+            for (d = wdepth - 1; d >= 1; d--) {
+                tcg_gen_mov_i32(wcond[d], wcond[d - 1]);
+            }
+            tcg_gen_setcondi_i32(dc->sp_start.z ? TCG_COND_EQ : TCG_COND_NE,
+                                 wcond[0], cpu_gpr[reg], 0);
+        }
+
+        /* Oldest iteration first, which is the order the .D units would
+           reach memory in. */
+        for (k = nstages - 1; k >= 0; k--) {
+            int issue = k * ii + c;
+            int landed = issue - SP_LOAD_DELAY;
+
+            /* Loads issued four cycles ago arrive now. They go through the
+               writeback list, so an instruction reading the register in
+               this same cycle still sees the old value. */
+            if (landed >= 0 && landed < dynlen) {
+                for (n = 0; n < SP_LOADS_PER_CYCLE; n++) {
+                    SPLoad *l = &loads[landed * SP_LOADS_PER_CYCLE + n];
+                    TCGv_i32 sel;
+
+                    if (!l->present) {
+                        continue;
+                    }
+                    sel = tcg_temp_new_i32();
+                    tcg_gen_movcond_i32(TCG_COND_NE, sel, l->valid[l->depth],
+                                        tcg_constant_i32(0),
+                                        l->val[l->depth], cpu_gpr[l->reg]);
+                    wb_add(dc, l->reg, sel);
+                }
+            }
+
+            if (issue >= dynlen || !body[issue].present) {
+                continue;
+            }
+            dc->sp.bc = issue;
+            dc->sp.nld = 0;
+            dc->packet_pc = body[issue].addr;
+            dc->pce1 = body[issue].pce1;
+
+            for (i = 0; i < body[issue].n; i++) {
+                const DisasInsn *di = &body[issue].ins[i];
+                TCGv_i32 gate = live[k];
+                int km;
+
+                if (di->op && (di->op->mnem == TIC6X_MNEM_spkernel ||
+                               di->op->mnem == TIC6X_MNEM_spmask)) {
+                    continue;
+                }
+                if (umask[issue] && sp_unit_masked(di, umask[issue])) {
+                    /* SPMASKed: executed once, as the buffer loads, which
+                       is the pass where stage k holds iteration 0. */
+                    gate = sp_gate_pass(live[k], pass, k, TCG_COND_EQ);
+                } else {
+                    /* And suppressed in the cycle where a younger stage's
+                       SPMASK claims this unit. */
+                    for (km = k + 1; km < nstages; km++) {
+                        int at = km * ii + c;
+
+                        if (at < dynlen && umask[at] &&
+                            sp_unit_masked(di, umask[at])) {
+                            gate = sp_gate_pass(gate, pass, km, TCG_COND_NE);
+                        }
+                    }
+                }
+                dc->sp.gate = gate;
+                dc->insn_pc = di->pc;
+                trans_one(dc, di);
+                dc->sp.gate = NULL;
+            }
+        }
+        wb_flush(dc);
+    }
+
+    dc->sp.active = false;
+    dc->sp.ld = NULL;
+
+    /* ---- the stage boundary ---- */
+
+    tcg_gen_addi_i32(pass, pass, 1);
+
+    /* The delay lines move with the pass. */
+    for (bc = 0; bc < dynlen; bc++) {
+        for (n = 0; n < SP_LOADS_PER_CYCLE; n++) {
+            SPLoad *l = &loads[bc * SP_LOADS_PER_CYCLE + n];
+
+            if (!l->present) {
+                continue;
+            }
+            for (d = l->depth; d >= 1; d--) {
+                tcg_gen_mov_i32(l->val[d], l->val[d - 1]);
+                tcg_gen_mov_i32(l->valid[d], l->valid[d - 1]);
+            }
+        }
+    }
+
+    if (kind == TIC6X_MNEM_sploopw) {
+        TCGv_i32 tested = tcg_temp_new_i32();
+        TCGv_i32 keep = tcg_temp_new_i32();
+
+        tcg_gen_setcondi_i32(TCG_COND_GTU, tested, pass, wskip);
+        tcg_gen_movcond_i32(TCG_COND_NE, keep, tested, tcg_constant_i32(0),
+                            wcond[wdepth - 1], tcg_constant_i32(1));
+        tcg_gen_and_i32(go, go, keep);
+        /*
+         * SPLOOPW has no epilog. When the condition fails the whole
+         * pipeline stops where it stands, part-finished iterations and all;
+         * SPRUFE8B 7.10 says the body must be written to tolerate that.
+         */
+        tcg_gen_brcondi_i32(TCG_COND_EQ, go, 0, loop_done);
+    } else {
+        tcg_gen_setcond_i32(TCG_COND_LTU, go, pass, iters);
+    }
+
+    /* The whole loop runs inside one translation block, so a condition that
+       never comes true would hang with no way out. Bound it and say so. */
+    tcg_gen_brcondi_i32(TCG_COND_GEU, pass, TIC6X_SPLOOP_MAX_PASSES, runaway);
+    tcg_gen_br(loop_top);
+
+    gen_set_label(runaway);
+    gen_helper_sploop_runaway(tcg_env, tcg_constant_i32(dc->packet_pc));
+
+    gen_set_label(loop_done);
+    if (kind != TIC6X_MNEM_sploopw) {
+        /* ILC counted down to zero as the loop ran. */
+        tcg_gen_st_i32(tcg_constant_i32(0), tcg_env,
+                       offsetof(CPUTIC6XState, cr[TIC6X_CR_ILC]));
+    }
+
+out:
+    dc->sp.active = false;
+    dc->sp.gate = NULL;
+    dc->sp.ld = NULL;
+    g_free(body);
+    g_free(umask);
+    g_free(loads);
+    return resume;
+}
+
+/*
+ * Translate one execute packet, and return how many bytes of instruction
+ * stream it consumed and how many cycles it took.
+ */
+static int translate_packet(CPUState *cs, DisasContext *dc, uint32_t pc,
+                            int *cycles)
+{
+    DisasPacket pk;
+
+    dc->nwb = 0;
+    dc->sp_start.active = false;
+
+    scan_packet(cs, dc, pc, &pk);
+    emit_packet(dc, &pk);
     wb_flush(dc);
-    return consumed ? consumed : 4;
+    *cycles = pk.cycles;
+
+    if (dc->sp_start.active) {
+        /*
+         * The loop starts on the cycle after this packet, and takes over the
+         * instruction stream as far as its SPKERNEL. Its own cycles are not
+         * added to *cycles: nothing may branch across an SPLOOP.
+         */
+        dc->sp_start.active = false;
+        return gen_sploop(cs, dc, pk.next) - pc;
+    }
+    return pk.next - pc;
 }
 
 /* ------------------------------------------------------- translator ops */
@@ -1576,6 +2405,10 @@ static void tic6x_tr_init_disas_context(DisasContextBase *dcbase,
     dc->br_countdown = dc->base.tb->flags ? (int)dc->base.tb->flags : -1;
     dc->br_just_set = false;
     dc->nwb = 0;
+    dc->sp_start.active = false;
+    dc->sp.active = false;
+    dc->sp.gate = NULL;
+    dc->sp.ld = NULL;
 }
 
 static void tic6x_tr_tb_start(DisasContextBase *dcbase, CPUState *cs)

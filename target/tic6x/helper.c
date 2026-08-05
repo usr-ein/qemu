@@ -53,6 +53,26 @@ G_NORETURN void HELPER(illegal)(CPUTIC6XState *env, uint32_t insn)
 }
 
 /*
+ * An SPLOOP that never ends. The loop is one translation block with a branch
+ * back to its own head, so this is the only way out; it means either a
+ * termination condition the model gets wrong or a guest doing something
+ * SPRUFE8B does not describe. Either way, stopping with a message beats
+ * spinning forever inside a block the debugger cannot reach into.
+ */
+G_NORETURN void HELPER(sploop_runaway)(CPUTIC6XState *env, uint32_t pc)
+{
+    CPUState *cs = env_cpu(env);
+
+    env->pc = pc;
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "tic6x: the SPLOOP at 0x%08x ran %u passes without "
+                  "reaching its termination condition\n",
+                  pc, TIC6X_SPLOOP_MAX_PASSES);
+    cs->exception_index = TIC6X_EXCP_SPLOOP_RUNAWAY;
+    cpu_loop_exit(cs);
+}
+
+/*
  * The control register file. Reading one that is not modelled returns zero
  * and says so once: a control register quietly reading zero is a classic way
  * for a boot to hang with no clue why, and the log line is the clue.
@@ -145,6 +165,7 @@ void tic6x_cpu_do_interrupt(CPUState *cs)
     case TIC6X_EXCP_UNIMPLEMENTED:
     case TIC6X_EXCP_ILLEGAL:
     case TIC6X_EXCP_FETCH_ABORT:
+    case TIC6X_EXCP_SPLOOP_RUNAWAY:
         /*
          * Stop rather than pretend. A DSP that carries on past an
          * instruction it did not run produces wrong answers quietly, and
