@@ -163,6 +163,15 @@ static void cdj2knxs_dsp_init(MachineState *machine)
     cdj2knxs_dsp_watch(sysmem, "dsp.intc", 0x01800000, 0x00001000);
     cdj2knxs_dsp_watch(sysmem, "dsp.emifa", 0x68000000, 0x00008000);
 
+    /*
+     * Shared RAM and the EMIFB SDRAM, SPRS377: 128 KB at 0x80000000 and
+     * 256 MB at 0xc0000000. Watched rather than backed with RAM, on purpose
+     * and for now - the question being asked is whether the firmware touches
+     * them at all, and giving them memory would answer it by hiding it.
+     */
+    cdj2knxs_dsp_watch(sysmem, "dsp.shram", 0x80000000, 0x00020000);
+    cdj2knxs_dsp_watch(sysmem, "dsp.ddr", 0xc0000000, 0x10000000);
+
     cpu = TIC6X_CPU(object_new(machine->cpu_type));
     /*
      * The entry point is the word the host writes at the base of L2. Taking
