@@ -39,6 +39,8 @@
 #include "system/memory.h"
 #include "system/reset.h"
 #include "qemu/log.h"
+#include "chardev/char-fe.h"
+#include <sys/mman.h>
 #include "hw/core/cpu.h"
 #include "target/sh4/cpu.h"
 
@@ -101,6 +103,31 @@
 #define CDJ2KNXS_HPIC_HINT      0x0004      /* DSP to host, host clears it  */
 #define CDJ2KNXS_HPIC_HRDY      0x0008      /* the port is ready for a word */
 
+/*
+ * The DSP's L2 RAM, which is where the two processors actually meet.
+ *
+ * Everything the host port carries lands in DSP memory, and the part of it
+ * that matters is L2: the program goes to 0x11801da0, the entry point to
+ * 0x11800000, the mailbox to 0x11837bc0. All of that is inside the 256 KB
+ * at 0x11800000.
+ *
+ * Set CDJ_DSP_L2FILE to the same path here and on the DSP machine and both
+ * map the same bytes, so what this writes is what that executes. Without it
+ * the window is private memory and the DSP model is a stub, which is how it
+ * behaved before there was a DSP to talk to.
+ */
+#define CDJ2KNXS_DSP_L2_BASE    0x11800000
+#define CDJ2KNXS_DSP_L2_SIZE    (256 * KiB)
+
+/*
+ * Nothing but memory crosses between the two machines yet. The DSP starts
+ * when the entry point appears at the base of L2, which the firmware writes
+ * last and immediately before it pulses DSPINT - so the word appearing is
+ * the same event as the core being let go, and it needs no side channel.
+ * DSPINT and HINT will need one when the DSP is far enough along to take
+ * interrupts; it is not.
+ */
+
 typedef struct CDJ2KNXSDSP {
     MemoryRegion iomem;
     uint32_t hpic;
@@ -109,7 +136,22 @@ typedef struct CDJ2KNXSDSP {
     uint32_t mbox_log;
     uint32_t reply;
     uint8_t *mem;
+    uint8_t *l2;                /* shared with the DSP machine, or NULL */
 } CDJ2KNXSDSP;
+
+/*
+ * Where a DSP address lands. Inside L2 that is the shared mapping if there
+ * is one; everything else stays in the private window, which is enough for
+ * the parts of the DSP's address space this model does not share.
+ */
+static uint8_t *cdj2knxs_dsp_host(CDJ2KNXSDSP *s, uint32_t addr)
+{
+    if (s->l2 && addr >= CDJ2KNXS_DSP_L2_BASE &&
+        addr < CDJ2KNXS_DSP_L2_BASE + CDJ2KNXS_DSP_L2_SIZE) {
+        return s->l2 + (addr - CDJ2KNXS_DSP_L2_BASE);
+    }
+    return s->mem + (addr & (CDJ2KNXS_DSP_MEM - 1));
+}
 
 /*
  * The mailbox the firmware and the DSP talk through, once the download is
@@ -165,7 +207,7 @@ static uint64_t cdj2knxs_dsp_read(void *opaque, hwaddr off, unsigned size)
     case 1:
         return s->hpia;
     default:                            /* HPID, either window */
-        memcpy(&v, s->mem + (s->hpia & (CDJ2KNXS_DSP_MEM - 1)), 4);
+        memcpy(&v, cdj2knxs_dsp_host(s, s->hpia), 4);
         if (s->hpia == CDJ2KNXS_DSP_REPLY && getenv("CDJ_DSP_REPLY")) {
             const char *mode = getenv("CDJ_DSP_REPLY");
 
@@ -176,8 +218,7 @@ static uint64_t cdj2knxs_dsp_read(void *opaque, hwaddr off, unsigned size)
             } else if (!strcmp(mode, "ones")) {
                 v = 0xffffffff;
             } else if (!strcmp(mode, "echo")) {
-                memcpy(&v, s->mem + (CDJ2KNXS_DSP_CMD &
-                                     (CDJ2KNXS_DSP_MEM - 1)), 4);
+                memcpy(&v, cdj2knxs_dsp_host(s, CDJ2KNXS_DSP_CMD), 4);
             }
         }
         if (cdj2knxs_dsp_mbox(s->hpia) && getenv("CDJ_DSP_MBOX") &&
@@ -208,7 +249,15 @@ static void cdj2knxs_dsp_write(void *opaque, hwaddr off, uint64_t value,
             s->hpic &= ~CDJ2KNXS_HPIC_HINT;     /* host acknowledges */
         }
         if (v & CDJ2KNXS_HPIC_DSPINT) {
-            /* Taken and answered at once: nothing here runs the DSP. */
+            /*
+             * The doorbell. On the board a running DSP takes this as an
+             * interrupt, which clears it, and answers by raising HINT.
+             *
+             * The first one is also the starting gun: the firmware pulses it
+             * immediately after writing the entry point at the base of L2,
+             * which is exactly the moment the real core is let go. So that is
+             * when the other machine is told to start, over the chardev.
+             */
             s->hpic &= ~CDJ2KNXS_HPIC_DSPINT;
             s->hpic |= CDJ2KNXS_HPIC_HINT;
         }
@@ -240,7 +289,7 @@ static void cdj2knxs_dsp_write(void *opaque, hwaddr off, uint64_t value,
             qemu_log("mbox: write 0x%08x = 0x%08x  from pc 0x%08x\n",
                      s->hpia, v, cdj2knxs_guest_pc());
         }
-        memcpy(s->mem + (s->hpia & (CDJ2KNXS_DSP_MEM - 1)), &v, 4);
+        memcpy(cdj2knxs_dsp_host(s, s->hpia), &v, 4);
         s->hpia += 4;
         s->words++;
         return;
@@ -258,12 +307,38 @@ static const MemoryRegionOps cdj2knxs_dsp_ops = {
 static void cdj2knxs_dsp_init(MemoryRegion *sysmem)
 {
     CDJ2KNXSDSP *s = g_new0(CDJ2KNXSDSP, 1);
+    const char *l2file = getenv("CDJ_DSP_L2FILE");
 
     s->mem = g_malloc0(CDJ2KNXS_DSP_MEM);
+
+    /*
+     * Map the DSP's L2 from a file if one is named, so the machine running
+     * the DSP sees the same bytes. The file has to exist and be the right
+     * size; creating it here rather than requiring the user to means the two
+     * sides can be started in either order.
+     */
+    if (l2file) {
+        int fd = open(l2file, O_RDWR | O_CREAT, 0644);
+
+        if (fd < 0 || ftruncate(fd, CDJ2KNXS_DSP_L2_SIZE) < 0) {
+            error_report("cdj2knxs: cannot use '%s' for the DSP's L2: %s",
+                         l2file, strerror(errno));
+            exit(1);
+        }
+        s->l2 = mmap(NULL, CDJ2KNXS_DSP_L2_SIZE, PROT_READ | PROT_WRITE,
+                     MAP_SHARED, fd, 0);
+        if (s->l2 == MAP_FAILED) {
+            error_report("cdj2knxs: cannot map '%s': %s",
+                         l2file, strerror(errno));
+            exit(1);
+        }
+        close(fd);
+    }
     memory_region_init_io(&s->iomem, NULL, &cdj2knxs_dsp_ops, s,
                           "cdj2knxs.dsp-hpi", CDJ2KNXS_DSP_WINDOW);
     memory_region_add_subregion_overlap(sysmem, CDJ2KNXS_DSP_BASE,
                                         &s->iomem, 1);
+
 }
 
 #define CDJ2KNXS_EXTBUS_BASE    0x0c000000

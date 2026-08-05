@@ -30,6 +30,8 @@
 #include "qemu/units.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
+#include "hw/core/cpu.h"
 #include "qapi/error.h"
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
@@ -99,6 +101,51 @@ static void cdj2knxs_dsp_watch(MemoryRegion *sysmem, const char *name,
     memory_region_add_subregion_overlap(sysmem, base, mr, -1000);
 }
 
+/*
+ * Hold the core until the main processor has written an entry point, then
+ * start it there. The timer runs on the machine's clock, so it costs nothing
+ * while the DSP is halted.
+ */
+typedef struct {
+    ArchCPU *cpu;
+    QEMUTimer *timer;
+} CDJ2KNXSDSPStart;
+
+static void cdj2knxs_dsp_poll_entry(void *opaque)
+{
+    CDJ2KNXSDSPStart *st = opaque;
+    CPUState *cs = CPU(st->cpu);
+    uint8_t word[4];
+    uint32_t entry;
+
+    cpu_physical_memory_read(CDJ_DSP_L2_BASE, word, sizeof(word));
+    entry = ldl_le_p(word);
+
+    if (entry >= CDJ_DSP_L2_BASE &&
+        entry < CDJ_DSP_L2_BASE + CDJ_DSP_L2_SIZE) {
+        cpu_env(cs)->pc = entry;
+        cs->halted = 0;
+        cpu_resume(cs);
+        qemu_log_mask(LOG_UNIMP,
+                      "dsp: released by the host, starting at 0x%08x\n", entry);
+        timer_free(st->timer);
+        g_free(st);
+        return;
+    }
+    timer_mod(st->timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
+}
+
+static void cdj2knxs_dsp_wait_for_entry(ArchCPU *cpu)
+{
+    CDJ2KNXSDSPStart *st = g_new0(CDJ2KNXSDSPStart, 1);
+
+    CPU(cpu)->halted = 1;
+    st->cpu = cpu;
+    st->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, cdj2knxs_dsp_poll_entry, st);
+    timer_mod(st->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
+}
+
 static void cdj2knxs_dsp_init(MachineState *machine)
 {
     MemoryRegion *sysmem = get_system_memory();
@@ -108,8 +155,28 @@ static void cdj2knxs_dsp_init(MachineState *machine)
     ArchCPU *cpu;
     uint32_t entry = 0;
 
-    memory_region_init_ram(l2, NULL, "cdj2knxs-dsp.l2", CDJ_DSP_L2_SIZE,
-                           &error_fatal);
+    /*
+     * L2 is where the two processors meet.
+     *
+     * On the board the main processor writes this memory through the DSP's
+     * host port: it is a memory interface, not a wire, so the two machines
+     * cannot be joined by a chardev the way the GUI processor is. QEMU
+     * builds one target per binary, so they cannot be one process either.
+     * What is left is to put L2 in a file and let both map it.
+     *
+     * Set CDJ_DSP_L2FILE to the same path on both sides. Without it this
+     * falls back to private memory, which is what the standalone -bios mode
+     * needs and is how the DSP was brought up.
+     */
+    if (getenv("CDJ_DSP_L2FILE")) {
+        memory_region_init_ram_from_file(l2, NULL, "cdj2knxs-dsp.l2",
+                                         CDJ_DSP_L2_SIZE, 0,
+                                         RAM_SHARED, getenv("CDJ_DSP_L2FILE"),
+                                         0, &error_fatal);
+    } else {
+        memory_region_init_ram(l2, NULL, "cdj2knxs-dsp.l2", CDJ_DSP_L2_SIZE,
+                               &error_fatal);
+    }
     memory_region_add_subregion(sysmem, CDJ_DSP_L2_BASE, l2);
 
     memory_region_init_ram(l1p, NULL, "cdj2knxs-dsp.l1p", CDJ_DSP_L1P_SIZE,
@@ -173,6 +240,18 @@ static void cdj2knxs_dsp_init(MachineState *machine)
     cdj2knxs_dsp_watch(sysmem, "dsp.ddr", 0xc0000000, 0x10000000);
 
     cpu = TIC6X_CPU(object_new(machine->cpu_type));
+
+    /*
+     * With shared L2 there is no -bios and no entry point yet: the main
+     * processor has not written one. Hold the core and watch the word at the
+     * base of L2, which is the last thing the download writes and is
+     * immediately followed by the DSPINT that lets the real core go. So that
+     * word appearing IS the release, and it needs no side channel.
+     *
+     * Polling rather than a callback because the writer is another process
+     * writing through a shared mapping; there is nothing to hook.
+     */
+
     /*
      * The entry point is the word the host writes at the base of L2. Taking
      * it from memory rather than hard-coding it means the model follows the
@@ -180,6 +259,10 @@ static void cdj2knxs_dsp_init(MachineState *machine)
      */
     object_property_set_uint(OBJECT(cpu), "reset-pc", entry, &error_fatal);
     qdev_realize(DEVICE(cpu), NULL, &error_fatal);
+
+    if (getenv("CDJ_DSP_L2FILE") && !entry) {
+        cdj2knxs_dsp_wait_for_entry(cpu);
+    }
 }
 
 static void cdj2knxs_dsp_machine_init(MachineClass *mc)
