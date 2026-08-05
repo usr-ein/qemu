@@ -42,7 +42,7 @@
              'loongarch64', 'm68k', 'microblaze', 'mips', 'mips64',
              'mips64el', 'mipsel', 'or1k', 'ppc',
              'ppc64', 'riscv32', 'riscv64', 'rx', 's390x', 'sh4',
-             'sh4eb', 'sparc', 'sparc64', 'tricore',
+             'sh4eb', 'sparc', 'sparc64', 'tic6x', 'tricore',
              'x86_64', 'xtensa', 'xtensaeb' ] }
 
 ##

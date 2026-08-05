@@ -1,0 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+config CDJ2KNXS_DSP
+    bool
+    default y
+    depends on TIC6X

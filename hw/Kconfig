@@ -67,6 +67,7 @@ source riscv/Kconfig
 source rx/Kconfig
 source s390x/Kconfig
 source sh4/Kconfig
+source tic6x/Kconfig
 source sparc/Kconfig
 source sparc64/Kconfig
 source tricore/Kconfig
