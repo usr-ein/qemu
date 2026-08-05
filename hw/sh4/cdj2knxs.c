@@ -105,6 +105,8 @@ typedef struct CDJ2KNXSDSP {
     uint32_t hpic;
     uint32_t hpia;
     uint32_t words;
+    uint32_t mbox_log;
+    uint32_t mbox_armed;
     uint8_t *mem;
 } CDJ2KNXSDSP;
 
@@ -124,6 +126,12 @@ static uint64_t cdj2knxs_dsp_read(void *opaque, hwaddr off, unsigned size)
         return s->hpia;
     default:                            /* HPID, either window */
         memcpy(&v, s->mem + (s->hpia & (CDJ2KNXS_DSP_MEM - 1)), 4);
+        if (s->mbox_armed && getenv("CDJ_DSP_MBOX") && s->mbox_log++ < 200) {
+            qemu_log("mbox: read  0x%08x = 0x%08x\n", s->hpia, v);
+        }
+        if (s->mbox_armed) {
+            s->mbox_armed--;
+        }
         s->hpia += 4;
         s->words++;
         return v;
@@ -158,8 +166,18 @@ static void cdj2knxs_dsp_write(void *opaque, hwaddr off, uint64_t value,
             s->words = 0;
         }
         s->hpia = v;
+        /* A short burst after a mailbox address is the poll, not the image. */
+        if (v >= 0x11837b80 && v < 0x11837c00) {
+            s->mbox_armed = 3;
+        }
         return;
     default:
+        if (s->mbox_armed && getenv("CDJ_DSP_MBOX") && s->mbox_log++ < 200) {
+            qemu_log("mbox: write 0x%08x = 0x%08x\n", s->hpia, v);
+        }
+        if (s->mbox_armed) {
+            s->mbox_armed--;
+        }
         memcpy(s->mem + (s->hpia & (CDJ2KNXS_DSP_MEM - 1)), &v, 4);
         s->hpia += 4;
         s->words++;
