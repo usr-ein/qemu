@@ -107,9 +107,42 @@ typedef struct CDJ2KNXSDSP {
     uint32_t hpia;
     uint32_t words;
     uint32_t mbox_log;
-    uint32_t mbox_armed;
+    uint32_t reply;
     uint8_t *mem;
 } CDJ2KNXSDSP;
+
+/*
+ * The mailbox the firmware and the DSP talk through, once the download is
+ * done. Everything else on the port is bulk: the program image and the four
+ * 32 KB blocks after it. This window is the conversation - an eight-word
+ * command block and a reply slot just above it - and it is the only part
+ * worth reading a value at a time. Arming on a preceding address write was
+ * too fragile: a single stray access shifted the window and the interesting
+ * traffic went unlogged.
+ */
+#define CDJ2KNXS_DSP_MBOX_LO    0x11837b00
+#define CDJ2KNXS_DSP_MBOX_HI    0x11837c00
+
+/*
+ * Within that window, two addresses matter. The firmware writes an eight-word
+ * command block at 0x11837bc0 every round and reads it straight back, and it
+ * reads one word at 0x11837bf8 that it never writes. That asymmetry is the
+ * whole protocol as far as this model can see it: the block is the host's
+ * side, the single word is the DSP's answer. Backed by plain RAM the answer
+ * is whatever the program image left there and never changes, so the firmware
+ * waits its 5000 ticks and declares the device dead.
+ *
+ * CDJ_DSP_REPLY exists to find out what a live answer looks like without
+ * guessing in the model itself: it makes that one word behave differently -
+ * tick, zero, ones, echo - so the firmware can be asked which it accepts.
+ */
+#define CDJ2KNXS_DSP_CMD        0x11837bc0
+#define CDJ2KNXS_DSP_REPLY      0x11837bf8
+
+static bool cdj2knxs_dsp_mbox(uint32_t addr)
+{
+    return addr >= CDJ2KNXS_DSP_MBOX_LO && addr < CDJ2KNXS_DSP_MBOX_HI;
+}
 
 static uint32_t cdj2knxs_guest_pc(void)
 {
@@ -133,12 +166,24 @@ static uint64_t cdj2knxs_dsp_read(void *opaque, hwaddr off, unsigned size)
         return s->hpia;
     default:                            /* HPID, either window */
         memcpy(&v, s->mem + (s->hpia & (CDJ2KNXS_DSP_MEM - 1)), 4);
-        if (s->mbox_armed && getenv("CDJ_DSP_MBOX") && s->mbox_log++ < 200) {
+        if (s->hpia == CDJ2KNXS_DSP_REPLY && getenv("CDJ_DSP_REPLY")) {
+            const char *mode = getenv("CDJ_DSP_REPLY");
+
+            if (!strcmp(mode, "tick")) {
+                v = ++s->reply;
+            } else if (!strcmp(mode, "zero")) {
+                v = 0;
+            } else if (!strcmp(mode, "ones")) {
+                v = 0xffffffff;
+            } else if (!strcmp(mode, "echo")) {
+                memcpy(&v, s->mem + (CDJ2KNXS_DSP_CMD &
+                                     (CDJ2KNXS_DSP_MEM - 1)), 4);
+            }
+        }
+        if (cdj2knxs_dsp_mbox(s->hpia) && getenv("CDJ_DSP_MBOX") &&
+            s->mbox_log++ < 4000) {
             qemu_log("mbox: read  0x%08x = 0x%08x  from pc 0x%08x\n",
                      s->hpia, v, cdj2knxs_guest_pc());
-        }
-        if (s->mbox_armed) {
-            s->mbox_armed--;
         }
         s->hpia += 4;
         s->words++;
@@ -175,18 +220,12 @@ static void cdj2knxs_dsp_write(void *opaque, hwaddr off, uint64_t value,
             s->words = 0;
         }
         s->hpia = v;
-        /* A short burst after a mailbox address is the poll, not the image. */
-        if (v >= 0x11837b80 && v < 0x11837c00) {
-            s->mbox_armed = 3;
-        }
         return;
     default:
-        if (s->mbox_armed && getenv("CDJ_DSP_MBOX") && s->mbox_log++ < 200) {
+        if (cdj2knxs_dsp_mbox(s->hpia) && getenv("CDJ_DSP_MBOX") &&
+            s->mbox_log++ < 4000) {
             qemu_log("mbox: write 0x%08x = 0x%08x  from pc 0x%08x\n",
                      s->hpia, v, cdj2knxs_guest_pc());
-        }
-        if (s->mbox_armed) {
-            s->mbox_armed--;
         }
         memcpy(s->mem + (s->hpia & (CDJ2KNXS_DSP_MEM - 1)), &v, 4);
         s->hpia += 4;
