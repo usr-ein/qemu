@@ -40,6 +40,7 @@
 #include "system/reset.h"
 #include "qemu/log.h"
 #include "chardev/char-fe.h"
+#include "chardev/char.h"
 #include <sys/mman.h>
 #include "hw/core/cpu.h"
 #include "target/sh4/cpu.h"
@@ -120,13 +121,28 @@
 #define CDJ2KNXS_DSP_L2_SIZE    (256 * KiB)
 
 /*
- * Nothing but memory crosses between the two machines yet. The DSP starts
- * when the entry point appears at the base of L2, which the firmware writes
- * last and immediately before it pulses DSPINT - so the word appearing is
- * the same event as the core being let go, and it needs no side channel.
- * DSPINT and HINT will need one when the DSP is far enough along to take
- * interrupts; it is not.
+ * The doorbell.
+ *
+ * Memory crosses between the two machines through the shared L2 file, but
+ * memory alone cannot interrupt anybody. DSPINT and HINT are two bits going
+ * opposite ways across a boundary that is a process boundary here, so they
+ * need a channel of their own: a chardev carrying one byte per edge, 'D'
+ * for the host ringing the DSP and 'H' for the DSP answering.
+ *
+ * Both machines look for a chardev whose id is in CDJ_DSP_DOORBELL, or
+ * "doorbell" if it is not set, the same way both look for CDJ_DSP_L2FILE.
+ * Connect them with a socket and the two bits are real:
+ *
+ *   -chardev socket,id=doorbell,host=127.0.0.1,port=N,server=on,wait=off
+ *   -chardev socket,id=doorbell,host=127.0.0.1,port=N
+ *
+ * Without it the host port falls back to answering its own doorbell, which
+ * is what it did before there was a DSP to answer: DSPINT raises HINT
+ * immediately. That is a lie, but a legible one, and removing it outright
+ * would change how every existing run behaves.
  */
+#define CDJ2KNXS_DOORBELL_DSPINT    'D'     /* host rings the DSP           */
+#define CDJ2KNXS_DOORBELL_HINT      'H'     /* the DSP answers              */
 
 typedef struct CDJ2KNXSDSP {
     MemoryRegion iomem;
@@ -137,7 +153,30 @@ typedef struct CDJ2KNXSDSP {
     uint32_t reply;
     uint8_t *mem;
     uint8_t *l2;                /* shared with the DSP machine, or NULL */
+    CharFrontend doorbell;
+    bool wired;                 /* ... and something is on the other end  */
 } CDJ2KNXSDSP;
+
+static int cdj2knxs_doorbell_can_receive(void *opaque)
+{
+    return 16;
+}
+
+static void cdj2knxs_doorbell_receive(void *opaque, const uint8_t *buf,
+                                      int size)
+{
+    CDJ2KNXSDSP *s = opaque;
+    int i;
+
+    for (i = 0; i < size; i++) {
+        if (buf[i] == CDJ2KNXS_DOORBELL_HINT) {
+            s->hpic |= CDJ2KNXS_HPIC_HINT;
+            if (getenv("CDJ_DSP_TRACE")) {
+                qemu_log("dsp: HINT from the DSP\n");
+            }
+        }
+    }
+}
 
 /*
  * Where a DSP address lands. Inside L2 that is the shared mapping if there
@@ -270,7 +309,14 @@ static void cdj2knxs_dsp_write(void *opaque, hwaddr off, uint64_t value,
              * when the other machine is told to start, over the chardev.
              */
             s->hpic &= ~CDJ2KNXS_HPIC_DSPINT;
-            s->hpic |= CDJ2KNXS_HPIC_HINT;
+            if (s->wired) {
+                uint8_t b = CDJ2KNXS_DOORBELL_DSPINT;
+
+                qemu_chr_fe_write_all(&s->doorbell, &b, 1);
+            } else {
+                /* Nobody on the other end; answer it here, as before. */
+                s->hpic |= CDJ2KNXS_HPIC_HINT;
+            }
         }
         return;
     case 1:
@@ -345,6 +391,20 @@ static void cdj2knxs_dsp_init(MemoryRegion *sysmem)
         }
         close(fd);
     }
+    /* The doorbell, if one is wired up; see above. */
+    {
+        const char *id = getenv("CDJ_DSP_DOORBELL");
+        Chardev *chr = qemu_chr_find(id ? id : "doorbell");
+
+        if (chr && qemu_chr_fe_init(&s->doorbell, chr, NULL)) {
+            qemu_chr_fe_set_handlers(&s->doorbell,
+                                     cdj2knxs_doorbell_can_receive,
+                                     cdj2knxs_doorbell_receive,
+                                     NULL, NULL, s, NULL, true);
+            s->wired = true;
+        }
+    }
+
     memory_region_init_io(&s->iomem, NULL, &cdj2knxs_dsp_ops, s,
                           "cdj2knxs.dsp-hpi", CDJ2KNXS_DSP_WINDOW);
     memory_region_add_subregion_overlap(sysmem, CDJ2KNXS_DSP_BASE,

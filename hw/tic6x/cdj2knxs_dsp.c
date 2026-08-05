@@ -42,6 +42,8 @@
 #include "exec/cpu-common.h"
 #include "system/memory.h"
 #include "target/tic6x/cpu.h"
+#include "chardev/char-fe.h"
+#include "chardev/char.h"
 
 /*
  * The C6745/C6747 memory map, SPRS377. Only what the firmware uses is here;
@@ -99,6 +101,124 @@ static void cdj2knxs_dsp_watch(MemoryRegion *sysmem, const char *name,
     memory_region_init_io(mr, NULL, &cdj2knxs_dsp_unimp_ops,
                           (void *)(uintptr_t)base, name, size);
     memory_region_add_subregion_overlap(sysmem, base, mr, -1000);
+}
+
+/*
+ * The DSP's side of the host port, and the doorbell that carries it.
+ *
+ * UHPI is at 0x01E10000 (SPRS377 table 2-3) and HPIC, the one register that
+ * matters here, is at 0x01E10030. Two bits cross the boundary: the host sets
+ * DSPINT to ring the DSP, and the DSP raises HINT to answer. On the board
+ * they are wires. Here they are a chardev carrying one byte an edge, because
+ * the two processors are two processes and shared memory cannot interrupt
+ * anybody.
+ *
+ * Both machines look for a chardev whose id is in CDJ_DSP_DOORBELL, or
+ * "doorbell" if it is not set - the same wiring as CDJ_DSP_L2FILE. Without
+ * one this is an ordinary register that nothing rings.
+ *
+ * DSPINT is recorded rather than delivered: the C6747 raises interrupt 34
+ * for it, and this target has no interrupt delivery yet. So the firmware can
+ * see the bit by polling HPIC, and when interrupts arrive (task #28) this is
+ * where the line gets raised.
+ */
+#define CDJ_DSP_UHPI_BASE   0x01e10000
+#define CDJ_DSP_UHPI_SIZE   0x00001000
+#define CDJ_DSP_HPIC        0x30
+
+#define CDJ_DSP_HPIC_DSPINT 0x0002      /* host to DSP, the DSP clears it  */
+#define CDJ_DSP_HPIC_HINT   0x0004      /* DSP to host, the host clears it */
+
+#define CDJ_DOORBELL_DSPINT 'D'
+#define CDJ_DOORBELL_HINT   'H'
+
+typedef struct {
+    MemoryRegion iomem;
+    uint32_t hpic;
+    CharFrontend doorbell;
+    bool wired;
+} CDJDSPUHPI;
+
+static int cdj2knxs_uhpi_can_receive(void *opaque)
+{
+    return 16;
+}
+
+static void cdj2knxs_uhpi_receive(void *opaque, const uint8_t *buf, int size)
+{
+    CDJDSPUHPI *s = opaque;
+    int i;
+
+    for (i = 0; i < size; i++) {
+        if (buf[i] == CDJ_DOORBELL_DSPINT) {
+            s->hpic |= CDJ_DSP_HPIC_DSPINT;
+            qemu_log_mask(LOG_UNIMP,
+                          "dsp: DSPINT from the host; no interrupt to "
+                          "deliver it with yet, HPIC has the bit\n");
+        }
+    }
+}
+
+static uint64_t cdj2knxs_uhpi_read(void *opaque, hwaddr off, unsigned size)
+{
+    CDJDSPUHPI *s = opaque;
+
+    if (off == CDJ_DSP_HPIC) {
+        return s->hpic;
+    }
+    qemu_log_mask(LOG_UNIMP, "dsp: uhpi read  0x%08" HWADDR_PRIx "\n",
+                  CDJ_DSP_UHPI_BASE + off);
+    return 0;
+}
+
+static void cdj2knxs_uhpi_write(void *opaque, hwaddr off, uint64_t val,
+                                unsigned size)
+{
+    CDJDSPUHPI *s = opaque;
+
+    if (off != CDJ_DSP_HPIC) {
+        qemu_log_mask(LOG_UNIMP,
+                      "dsp: uhpi write 0x%08" HWADDR_PRIx " = 0x%08" PRIx64
+                      "\n", CDJ_DSP_UHPI_BASE + off, val);
+        return;
+    }
+    /* Writing one to either bit acts on it, which is how both sides of a
+       C6000 host port acknowledge and signal. */
+    if (val & CDJ_DSP_HPIC_DSPINT) {
+        s->hpic &= ~CDJ_DSP_HPIC_DSPINT;        /* the DSP acknowledges */
+    }
+    if (val & CDJ_DSP_HPIC_HINT) {
+        s->hpic |= CDJ_DSP_HPIC_HINT;
+        if (s->wired) {
+            uint8_t b = CDJ_DOORBELL_HINT;
+
+            qemu_chr_fe_write_all(&s->doorbell, &b, 1);
+        }
+    }
+}
+
+static const MemoryRegionOps cdj2knxs_uhpi_ops = {
+    .read = cdj2knxs_uhpi_read,
+    .write = cdj2knxs_uhpi_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static void cdj2knxs_dsp_uhpi_init(MemoryRegion *sysmem)
+{
+    CDJDSPUHPI *s = g_new0(CDJDSPUHPI, 1);
+    const char *id = getenv("CDJ_DSP_DOORBELL");
+    Chardev *chr = qemu_chr_find(id ? id : "doorbell");
+
+    if (chr && qemu_chr_fe_init(&s->doorbell, chr, NULL)) {
+        qemu_chr_fe_set_handlers(&s->doorbell, cdj2knxs_uhpi_can_receive,
+                                 cdj2knxs_uhpi_receive, NULL, NULL, s, NULL,
+                                 true);
+        s->wired = true;
+    }
+    memory_region_init_io(&s->iomem, NULL, &cdj2knxs_uhpi_ops, s,
+                          "dsp.uhpi", CDJ_DSP_UHPI_SIZE);
+    memory_region_add_subregion_overlap(sysmem, CDJ_DSP_UHPI_BASE,
+                                        &s->iomem, 1);
 }
 
 /*
@@ -244,6 +364,7 @@ static void cdj2knxs_dsp_init(MachineState *machine)
      */
     cdj2knxs_dsp_watch(sysmem, "dsp.cfg0", 0x01c00000, 0x00200000);
     cdj2knxs_dsp_watch(sysmem, "dsp.cfg1", 0x01e00000, 0x00200000);
+    cdj2knxs_dsp_uhpi_init(sysmem);
     cdj2knxs_dsp_watch(sysmem, "dsp.intc", 0x01800000, 0x00001000);
     cdj2knxs_dsp_watch(sysmem, "dsp.emifa", 0x68000000, 0x00008000);
 
