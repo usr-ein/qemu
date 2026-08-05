@@ -176,7 +176,8 @@ static uint8_t *cdj2knxs_dsp_host(CDJ2KNXSDSP *s, uint32_t addr)
  *
  * CDJ_DSP_REPLY exists to find out what a live answer looks like without
  * guessing in the model itself: it makes that one word behave differently -
- * tick, zero, ones, echo - so the firmware can be asked which it accepts.
+ * tick, zero, ones, echo, or any number - so the firmware can be asked
+ * which it accepts. 0x041C295E is where it decides.
  */
 #define CDJ2KNXS_DSP_CMD        0x11837bc0
 #define CDJ2KNXS_DSP_REPLY      0x11837bf8
@@ -219,6 +220,16 @@ static uint64_t cdj2knxs_dsp_read(void *opaque, hwaddr off, unsigned size)
                 v = 0xffffffff;
             } else if (!strcmp(mode, "echo")) {
                 memcpy(&v, cdj2knxs_dsp_host(s, CDJ2KNXS_DSP_CMD), 4);
+            } else {
+                /*
+                 * A plain number, because the firmware turns out to be
+                 * asking a specific question rather than a liveness one.
+                 * 0x041C295E reads this word and compares it with 7 and
+                 * with 8; anything else sets a flag one byte wide and the
+                 * round ends. So the useful probe is "answer N and see",
+                 * not "make it move".
+                 */
+                v = strtoul(mode, NULL, 0);
             }
         }
         if (cdj2knxs_dsp_mbox(s->hpia) && getenv("CDJ_DSP_MBOX") &&
