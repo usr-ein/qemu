@@ -69,6 +69,19 @@ typedef struct DisasContext {
     uint32_t packet_pc;
 
     /*
+     * PCE1: the address of the FETCH packet containing the execute packet,
+     * which is what every PC-relative constant is measured from. SPRUFE8B
+     * says it plainly for B - "added to the address of the first instruction
+     * of the fetch packet that contains the branch instruction" - and again
+     * for ADDKPC. It is not the execute packet address, and using that
+     * instead is wrong by up to 28 bytes whenever an execute packet starts
+     * part way into its fetch packet, which is most of them. That sent the
+     * firmware's startup to the wrong place and left it calling a null
+     * pointer a few hundred packets later.
+     */
+    uint32_t pce1;
+
+    /*
      * Writeback list for the packet. Register results are computed into
      * temporaries and applied together, which is what makes the parallel
      * instructions in a packet independent.
@@ -854,7 +867,7 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
         uint32_t nops = field_get(f, TIC6X_FLD_src2, insn);
         TCGv_i32 v = tcg_temp_new_i32();
 
-        tcg_gen_movi_i32(v, dc->packet_pc + (disp << 2));
+        tcg_gen_movi_i32(v, dc->pce1 + (disp << 2));
         wb_pred(dc, pred, dst, v);
         cycles = nops + 1;
         break;
@@ -1244,7 +1257,7 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
         if (pred) {
             tcg_gen_and_i32(take, take, pred);
         }
-        tcg_gen_movi_i32(target, dc->packet_pc + (disp << 2));
+        tcg_gen_movi_i32(target, dc->pce1 + (disp << 2));
         tcg_gen_movcond_i32(TCG_COND_NE, cpu_br_target, take,
                             tcg_constant_i32(0), target, cpu_br_target);
         tcg_gen_movcond_i32(TCG_COND_NE, cpu_br_taken, take,
@@ -1273,7 +1286,7 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
 
         tcg_gen_movi_i32(ret, dc->base.pc_next);
         wb_pred(dc, pred, link, ret);
-        tcg_gen_movi_i32(cpu_br_target, dc->packet_pc + (disp << 2));
+        tcg_gen_movi_i32(cpu_br_target, dc->pce1 + (disp << 2));
         tcg_gen_movi_i32(cpu_br_taken, 1);
         dc->br_countdown = 0;       /* lands at the end of this packet */
         break;
@@ -1328,7 +1341,7 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
             uint32_t raw = field_get(f, TIC6X_FLD_cst, insn);
             int32_t disp = (int32_t)(raw << 11) >> 11;   /* scst21 */
 
-            tcg_gen_movi_i32(target, dc->packet_pc + (disp << 2));
+            tcg_gen_movi_i32(target, dc->pce1 + (disp << 2));
         }
         if (pred) {
             tcg_gen_movcond_i32(TCG_COND_NE, cpu_br_target, pred,
@@ -1392,6 +1405,7 @@ static int translate_packet(CPUState *cs, DisasContext *dc, uint32_t pc,
     int n;
 
     dc->packet_pc = pc;
+    dc->pce1 = fp_base;
     dc->nwb = 0;
     *cycles = 1;
 
