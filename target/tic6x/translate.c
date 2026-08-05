@@ -666,6 +666,310 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
         break;
     }
 
+    case TIC6X_MNEM_lddw:
+    case TIC6X_MNEM_ldndw:
+    case TIC6X_MNEM_stdw:
+    case TIC6X_MNEM_stndw: {
+        /*
+         * Doubleword, into or out of a register pair. The pair is written
+         * A5:A4 and the even register holds the low half, so the field names
+         * the even one and the odd one follows. The nonaligned forms differ
+         * only in not requiring alignment, which this model never enforced
+         * anyway - there is no alignment fault here to avoid.
+         */
+        bool is_load = op->mnem == TIC6X_MNEM_lddw ||
+                       op->mnem == TIC6X_MNEM_ldndw;
+        uint32_t side = field_get(f, TIC6X_FLD_s, insn);
+        uint32_t num = field_get(f, TIC6X_FLD_srcdst, insn);
+        int lo = reg_of(side, num & ~1u);
+        int hi = reg_of(side, (num & ~1u) | 1u);
+        TCGv_i32 addr = addr_mode(dc, pred, f, insn, 3);
+        TCGv_i32 hiaddr = tcg_temp_new_i32();
+        TCGLabel *skip = NULL;
+
+        tcg_gen_addi_i32(hiaddr, addr, 4);
+        if (pred) {
+            skip = gen_new_label();
+            tcg_gen_brcondi_i32(TCG_COND_EQ, pred, 0, skip);
+        }
+        if (is_load) {
+            tcg_gen_qemu_ld_i32(cpu_gpr[lo], addr, 0, MO_LEUL);
+            tcg_gen_qemu_ld_i32(cpu_gpr[hi], hiaddr, 0, MO_LEUL);
+        } else {
+            tcg_gen_qemu_st_i32(cpu_gpr[lo], addr, 0, MO_LEUL);
+            tcg_gen_qemu_st_i32(cpu_gpr[hi], hiaddr, 0, MO_LEUL);
+        }
+        if (skip) {
+            gen_set_label(skip);
+        }
+        break;
+    }
+
+    case TIC6X_MNEM_ldnw:
+    case TIC6X_MNEM_stnw: {
+        /* Nonaligned word; the same as ldw and stw to a model that does not
+           fault on alignment. */
+        int reg = reg_of(field_get(f, TIC6X_FLD_s, insn),
+                         field_get(f, TIC6X_FLD_srcdst, insn));
+        TCGv_i32 addr = addr_mode(dc, pred, f, insn, 2);
+
+        if (op->mnem == TIC6X_MNEM_ldnw) {
+            gen_load(dc, pred, reg, addr, MO_LEUL);
+        } else {
+            gen_store(dc, pred, reg, addr, MO_LEUL);
+        }
+        break;
+    }
+
+    case TIC6X_MNEM_addab:
+    case TIC6X_MNEM_addah:
+    case TIC6X_MNEM_addaw:
+    case TIC6X_MNEM_addad:
+    case TIC6X_MNEM_subab:
+    case TIC6X_MNEM_subah:
+    case TIC6X_MNEM_subaw: {
+        /*
+         * Address arithmetic on the .D unit: the offset is scaled by the
+         * size the mnemonic names, which is what makes them different from
+         * a plain add.
+         */
+        int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
+        int src2 = reg_of(s, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 a = src1_value(f, op, insn, s);
+        TCGv_i32 v = tcg_temp_new_i32();
+        int scale = (op->mnem == TIC6X_MNEM_addab ||
+                     op->mnem == TIC6X_MNEM_subab) ? 0 :
+                    (op->mnem == TIC6X_MNEM_addah ||
+                     op->mnem == TIC6X_MNEM_subah) ? 1 :
+                    (op->mnem == TIC6X_MNEM_addad) ? 3 : 2;
+        bool sub = op->mnem == TIC6X_MNEM_subab ||
+                   op->mnem == TIC6X_MNEM_subah ||
+                   op->mnem == TIC6X_MNEM_subaw;
+
+        tcg_gen_shli_i32(v, a, scale);
+        if (sub) {
+            tcg_gen_sub_i32(v, cpu_gpr[src2], v);
+        } else {
+            tcg_gen_add_i32(v, cpu_gpr[src2], v);
+        }
+        wb_pred(dc, pred, dst, v);
+        break;
+    }
+
+    case TIC6X_MNEM_andn: {
+        int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
+        int src2 = reg_of(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 a = src1_value(f, op, insn, s);
+        TCGv_i32 v = tcg_temp_new_i32();
+
+        tcg_gen_andc_i32(v, a, cpu_gpr[src2]);
+        wb_pred(dc, pred, dst, v);
+        break;
+    }
+
+    case TIC6X_MNEM_mpy:
+    case TIC6X_MNEM_mpyu:
+    case TIC6X_MNEM_mpysu:
+    case TIC6X_MNEM_mpyus:
+    case TIC6X_MNEM_mpyh:
+    case TIC6X_MNEM_mpyhu:
+    case TIC6X_MNEM_mpylh:
+    case TIC6X_MNEM_mpyhl:
+    case TIC6X_MNEM_smpyh:
+    case TIC6X_MNEM_smpy: {
+        /*
+         * The sixteen-by-sixteen multiplies. Which half of each source is
+         * taken, and whether it is signed, is spelled out by the mnemonic:
+         * the trailing h or l on each side, and u or s for the sign. The
+         * smpy forms shift the result left by one and saturate, which is
+         * the fractional Q15 convention.
+         */
+        int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
+        int src2 = reg_of(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 a = src1_value(f, op, insn, s);
+        TCGv_i32 lhs = tcg_temp_new_i32();
+        TCGv_i32 rhs = tcg_temp_new_i32();
+        TCGv_i32 v = tcg_temp_new_i32();
+        bool hi1 = op->mnem == TIC6X_MNEM_mpyh ||
+                   op->mnem == TIC6X_MNEM_mpyhu ||
+                   op->mnem == TIC6X_MNEM_mpyhl ||
+                   op->mnem == TIC6X_MNEM_smpyh;
+        bool hi2 = op->mnem == TIC6X_MNEM_mpyh ||
+                   op->mnem == TIC6X_MNEM_mpyhu ||
+                   op->mnem == TIC6X_MNEM_mpylh ||
+                   op->mnem == TIC6X_MNEM_smpyh;
+        bool u1 = op->mnem == TIC6X_MNEM_mpyu ||
+                  op->mnem == TIC6X_MNEM_mpyhu ||
+                  op->mnem == TIC6X_MNEM_mpyus;
+        bool u2 = op->mnem == TIC6X_MNEM_mpyu ||
+                  op->mnem == TIC6X_MNEM_mpyhu ||
+                  op->mnem == TIC6X_MNEM_mpysu;
+
+        if (u1) {
+            tcg_gen_extract_i32(lhs, a, hi1 ? 16 : 0, 16);
+        } else {
+            tcg_gen_sextract_i32(lhs, a, hi1 ? 16 : 0, 16);
+        }
+        if (u2) {
+            tcg_gen_extract_i32(rhs, cpu_gpr[src2], hi2 ? 16 : 0, 16);
+        } else {
+            tcg_gen_sextract_i32(rhs, cpu_gpr[src2], hi2 ? 16 : 0, 16);
+        }
+        tcg_gen_mul_i32(v, lhs, rhs);
+        if (op->mnem == TIC6X_MNEM_smpy ||
+            op->mnem == TIC6X_MNEM_smpyh) {
+            /* Left shift by one, saturating the one case that overflows:
+               0x8000 * 0x8000 gives 0x40000000, which doubles out of range. */
+            TCGv_i32 sat = tcg_temp_new_i32();
+
+            tcg_gen_shli_i32(sat, v, 1);
+            tcg_gen_movcond_i32(TCG_COND_EQ, v, v,
+                                tcg_constant_i32(0x40000000),
+                                tcg_constant_i32(0x7fffffff), sat);
+        }
+        wb_pred(dc, pred, dst, v);
+        break;
+    }
+
+    case TIC6X_MNEM_mpy32: {
+        /* The low 32 bits of a 32 by 32 product. */
+        int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
+        int src2 = reg_of(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 a = src1_value(f, op, insn, s);
+        TCGv_i32 v = tcg_temp_new_i32();
+
+        tcg_gen_mul_i32(v, a, cpu_gpr[src2]);
+        wb_pred(dc, pred, dst, v);
+        break;
+    }
+
+    case TIC6X_MNEM_add2:
+    case TIC6X_MNEM_sub2: {
+        /* Two sixteen-bit lanes, no carry between them. */
+        int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
+        int src2 = reg_of(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 a = src1_value(f, op, insn, s);
+        TCGv_i32 lo = tcg_temp_new_i32();
+        TCGv_i32 hi = tcg_temp_new_i32();
+        TCGv_i32 v = tcg_temp_new_i32();
+
+        if (op->mnem == TIC6X_MNEM_add2) {
+            tcg_gen_add_i32(lo, a, cpu_gpr[src2]);
+            tcg_gen_add_i32(hi, a, cpu_gpr[src2]);
+        } else {
+            tcg_gen_sub_i32(lo, a, cpu_gpr[src2]);
+            tcg_gen_sub_i32(hi, a, cpu_gpr[src2]);
+        }
+        tcg_gen_andi_i32(lo, lo, 0x0000ffff);
+        tcg_gen_andi_i32(hi, hi, 0xffff0000);
+        tcg_gen_or_i32(v, lo, hi);
+        wb_pred(dc, pred, dst, v);
+        break;
+    }
+
+    case TIC6X_MNEM_pack2:
+    case TIC6X_MNEM_packlh2:
+    case TIC6X_MNEM_packhl2: {
+        /* Build a word from one half of each source. */
+        int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
+        int src2 = reg_of(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 a = src1_value(f, op, insn, s);
+        TCGv_i32 v = tcg_temp_new_i32();
+        TCGv_i32 t = tcg_temp_new_i32();
+        /* pack2 takes both low halves, packlh2 src1 low and src2 high,
+           packhl2 src1 high and src2 low. The result's high half comes
+           from src1. */
+        bool hi_from_src1_high = op->mnem == TIC6X_MNEM_packhl2;
+        bool lo_from_src2_high = op->mnem == TIC6X_MNEM_packlh2;
+
+        tcg_gen_extract_i32(t, a, hi_from_src1_high ? 16 : 0, 16);
+        tcg_gen_shli_i32(v, t, 16);
+        tcg_gen_extract_i32(t, cpu_gpr[src2], lo_from_src2_high ? 16 : 0, 16);
+        tcg_gen_or_i32(v, v, t);
+        wb_pred(dc, pred, dst, v);
+        break;
+    }
+
+    case TIC6X_MNEM_sadd:
+    case TIC6X_MNEM_ssub: {
+        /* Saturating 32-bit add and subtract. */
+        int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
+        int src2 = reg_of(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 a = src1_value(f, op, insn, s);
+        TCGv_i32 v = tcg_temp_new_i32();
+
+        TCGv_i32 ovf = tcg_temp_new_i32();
+        TCGv_i32 t = tcg_temp_new_i32();
+
+        if (op->mnem == TIC6X_MNEM_sadd) {
+            tcg_gen_add_i32(v, a, cpu_gpr[src2]);
+            /* Overflow when both operands differ from the result in sign. */
+            tcg_gen_xor_i32(ovf, a, v);
+            tcg_gen_xor_i32(t, cpu_gpr[src2], v);
+            tcg_gen_and_i32(ovf, ovf, t);
+        } else {
+            tcg_gen_sub_i32(v, a, cpu_gpr[src2]);
+            /* And for subtract, when the operands differ and the result
+               takes the subtrahend's sign. */
+            tcg_gen_xor_i32(ovf, a, cpu_gpr[src2]);
+            tcg_gen_xor_i32(t, a, v);
+            tcg_gen_and_i32(ovf, ovf, t);
+        }
+        /* On overflow the result clamps to the end it ran off. */
+        tcg_gen_sari_i32(t, v, 31);
+        tcg_gen_xori_i32(t, t, 0x7fffffff);
+        tcg_gen_movcond_i32(TCG_COND_LT, v, ovf, tcg_constant_i32(0), t, v);
+        wb_pred(dc, pred, dst, v);
+        break;
+    }
+
+    case TIC6X_MNEM_addsp:
+    case TIC6X_MNEM_subsp:
+    case TIC6X_MNEM_mpysp: {
+        int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
+        int src2 = reg_of(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 a = src1_value(f, op, insn, s);
+        TCGv_i32 v = tcg_temp_new_i32();
+
+        switch (op->mnem) {
+        case TIC6X_MNEM_addsp:
+            gen_helper_addsp(v, tcg_env, a, cpu_gpr[src2]);
+            break;
+        case TIC6X_MNEM_subsp:
+            gen_helper_subsp(v, tcg_env, a, cpu_gpr[src2]);
+            break;
+        default:
+            gen_helper_mpysp(v, tcg_env, a, cpu_gpr[src2]);
+            break;
+        }
+        wb_pred(dc, pred, dst, v);
+        break;
+    }
+
+    case TIC6X_MNEM_cmpeqsp:
+    case TIC6X_MNEM_cmpgtsp:
+    case TIC6X_MNEM_cmpltsp: {
+        int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
+        int src2 = reg_of(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 a = src1_value(f, op, insn, s);
+        TCGv_i32 v = tcg_temp_new_i32();
+
+        switch (op->mnem) {
+        case TIC6X_MNEM_cmpeqsp:
+            gen_helper_cmpeqsp(v, tcg_env, a, cpu_gpr[src2]);
+            break;
+        case TIC6X_MNEM_cmpgtsp:
+            gen_helper_cmpgtsp(v, tcg_env, a, cpu_gpr[src2]);
+            break;
+        default:
+            gen_helper_cmpltsp(v, tcg_env, a, cpu_gpr[src2]);
+            break;
+        }
+        wb_pred(dc, pred, dst, v);
+        break;
+    }
+
+    case TIC6X_MNEM_bnop:
     case TIC6X_MNEM_b: {
         /*
          * The target is recorded, not jumped to: five more execute packets
@@ -703,6 +1007,14 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
                           dc->packet_pc);
         }
         dc->br_countdown = TIC6X_BRANCH_DELAY;
+        /*
+         * BNOP is a branch with its own nop count, which fills some of the
+         * delay slots the branch just opened. The count has to be honoured
+         * for the same reason NOP n does: the slots are counted in cycles.
+         */
+        if (op->mnem == TIC6X_MNEM_bnop && field_present(f, TIC6X_FLD_n)) {
+            cycles = field_get(f, TIC6X_FLD_n, insn) + 1;
+        }
         break;
     }
 

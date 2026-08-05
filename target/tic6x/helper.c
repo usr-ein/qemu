@@ -13,6 +13,7 @@
 #include "exec/helper-proto.h"
 #include "accel/tcg/cpu-ldst.h"
 #include "system/runstate.h"
+#include "fpu/softfloat.h"
 
 /*
  * Growing instruction coverage works the same way it did for the Blackfin:
@@ -72,6 +73,63 @@ void HELPER(write_creg)(CPUTIC6XState *env, uint32_t crlo, uint32_t val)
     qemu_log_mask(LOG_UNIMP,
                   "tic6x: write of unmodelled control register %u = 0x%08x\n",
                   crlo, val);
+}
+
+/*
+ * Single-precision arithmetic, through softfloat so the results are the ones
+ * IEEE specifies rather than the host's.
+ *
+ * The rounding mode and the exception behaviour are configurable on this
+ * part, through FADCR, FAUCR and FMCR - which the firmware writes at its
+ * entry point, before anything else. Those are stored but not yet acted on:
+ * round-to-nearest and quiet NaNs are what the reset values select, so this
+ * is right until the firmware changes them, and wrong quietly if it does.
+ * Worth revisiting when there is a reason to trust the numbers.
+ */
+static float_status *sp_status(CPUTIC6XState *env)
+{
+    static float_status st;
+
+    set_float_rounding_mode(float_round_nearest_even, &st);
+    set_flush_to_zero(false, &st);
+    set_default_nan_mode(true, &st);
+    return &st;
+}
+
+uint32_t HELPER(addsp)(CPUTIC6XState *env, uint32_t a, uint32_t b)
+{
+    return float32_val(float32_add(make_float32(a), make_float32(b),
+                                   sp_status(env)));
+}
+
+uint32_t HELPER(subsp)(CPUTIC6XState *env, uint32_t a, uint32_t b)
+{
+    return float32_val(float32_sub(make_float32(a), make_float32(b),
+                                   sp_status(env)));
+}
+
+uint32_t HELPER(mpysp)(CPUTIC6XState *env, uint32_t a, uint32_t b)
+{
+    return float32_val(float32_mul(make_float32(a), make_float32(b),
+                                   sp_status(env)));
+}
+
+uint32_t HELPER(cmpeqsp)(CPUTIC6XState *env, uint32_t a, uint32_t b)
+{
+    return float32_eq_quiet(make_float32(a), make_float32(b),
+                            sp_status(env)) ? 1 : 0;
+}
+
+uint32_t HELPER(cmpgtsp)(CPUTIC6XState *env, uint32_t a, uint32_t b)
+{
+    return float32_lt(make_float32(b), make_float32(a),
+                      sp_status(env)) ? 1 : 0;
+}
+
+uint32_t HELPER(cmpltsp)(CPUTIC6XState *env, uint32_t a, uint32_t b)
+{
+    return float32_lt(make_float32(a), make_float32(b),
+                      sp_status(env)) ? 1 : 0;
 }
 
 void tic6x_cpu_do_interrupt(CPUState *cs)
