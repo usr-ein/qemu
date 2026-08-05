@@ -29,6 +29,7 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "qemu/error-report.h"
+#include "qemu/log.h"
 #include "qapi/error.h"
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
@@ -50,6 +51,53 @@
 #define CDJ_DSP_L1P_SIZE    (32 * KiB)
 #define CDJ_DSP_L1D_BASE    0x11f00000
 #define CDJ_DSP_L1D_SIZE    (32 * KiB)
+
+/*
+ * Everything outside RAM, logged rather than silently reading zero.
+ *
+ * The point is to be told what the firmware wants. A model that answers every
+ * address with zero looks like it is working right up until the firmware
+ * waits for a status bit that will never set, and then there is nothing to
+ * go on. This says which register, which access and from where, which is how
+ * the SH7764 and BF531 peripheral sets were built - let the firmware ask, and
+ * implement what it asks for.
+ */
+static uint64_t cdj2knxs_dsp_unimp_read(void *opaque, hwaddr off, unsigned size)
+{
+    hwaddr base = (hwaddr)(uintptr_t)opaque;
+
+    qemu_log_mask(LOG_UNIMP, "dsp: read  0x%08" HWADDR_PRIx " (%u bytes)\n",
+                  base + off, size);
+    return 0;
+}
+
+static void cdj2knxs_dsp_unimp_write(void *opaque, hwaddr off, uint64_t val,
+                                     unsigned size)
+{
+    hwaddr base = (hwaddr)(uintptr_t)opaque;
+
+    qemu_log_mask(LOG_UNIMP,
+                  "dsp: write 0x%08" HWADDR_PRIx " = 0x%08" PRIx64
+                  " (%u bytes)\n", base + off, val, size);
+}
+
+static const MemoryRegionOps cdj2knxs_dsp_unimp_ops = {
+    .read = cdj2knxs_dsp_unimp_read,
+    .write = cdj2knxs_dsp_unimp_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 8,
+};
+
+static void cdj2knxs_dsp_watch(MemoryRegion *sysmem, const char *name,
+                               hwaddr base, uint64_t size)
+{
+    MemoryRegion *mr = g_new(MemoryRegion, 1);
+
+    memory_region_init_io(mr, NULL, &cdj2knxs_dsp_unimp_ops,
+                          (void *)(uintptr_t)base, name, size);
+    memory_region_add_subregion_overlap(sysmem, base, mr, -1000);
+}
 
 static void cdj2knxs_dsp_init(MachineState *machine)
 {
@@ -103,6 +151,17 @@ static void cdj2knxs_dsp_init(MachineState *machine)
         }
         g_free(head);
     }
+
+    /*
+     * The peripheral windows, from the C6745/C6747 memory map in SPRS377.
+     * None are modelled yet; each one logs what the firmware asks of it so
+     * the set that actually matters can be built from evidence rather than
+     * from reading the datasheet front to back.
+     */
+    cdj2knxs_dsp_watch(sysmem, "dsp.cfg0", 0x01c00000, 0x00200000);
+    cdj2knxs_dsp_watch(sysmem, "dsp.cfg1", 0x01e00000, 0x00200000);
+    cdj2knxs_dsp_watch(sysmem, "dsp.intc", 0x01800000, 0x00001000);
+    cdj2knxs_dsp_watch(sysmem, "dsp.emifa", 0x68000000, 0x00008000);
 
     cpu = TIC6X_CPU(object_new(machine->cpu_type));
     /*
