@@ -206,6 +206,96 @@ static void wb_pred(DisasContext *dc, TCGv_i32 pred, int reg, TCGv_i32 val)
     }
 }
 
+static int reg_of(uint32_t side, uint32_t num);
+
+/* ------------------------------------------------------ register pairs */
+
+/*
+ * A pair is written A5:A4 and the even register holds the low half. The
+ * field names the even one; masking bit 0 off is defensive, since the
+ * assembler will not emit an odd number here.
+ */
+static TCGv_i64 pair_get(uint32_t side, uint32_t num)
+{
+    TCGv_i64 v = tcg_temp_new_i64();
+
+    tcg_gen_concat_i32_i64(v, cpu_gpr[reg_of(side, num & ~1u)],
+                           cpu_gpr[reg_of(side, (num & ~1u) | 1u)]);
+    return v;
+}
+
+static void pair_set(DisasContext *dc, TCGv_i32 pred, uint32_t side,
+                     uint32_t num, TCGv_i64 val)
+{
+    TCGv_i32 lo = tcg_temp_new_i32();
+    TCGv_i32 hi = tcg_temp_new_i32();
+
+    tcg_gen_extr_i64_i32(lo, hi, val);
+    wb_pred(dc, pred, reg_of(side, num & ~1u), lo);
+    wb_pred(dc, pred, reg_of(side, (num & ~1u) | 1u), hi);
+}
+
+/*
+ * The long tail of the instruction set - packed SIMD, the multiply variants,
+ * double precision - is routed to helpers in alu.c.inc rather than written
+ * as inline TCG, because getting a saturation boundary or a sign extension
+ * wrong in a hundred hand-rolled cases is a certainty and these are not
+ * where the time goes. What differs between them is only the shape of their
+ * operands, which is what these four groups are.
+ */
+static bool routed_alu2(uint16_t m)
+{
+    switch (m) {
+    case TIC6X_MNEM_addu: case TIC6X_MNEM_subu:
+    case TIC6X_MNEM_rotl: case TIC6X_MNEM_sshl:
+    case TIC6X_MNEM_lmbd: case TIC6X_MNEM_norm:
+    case TIC6X_MNEM_shlmb: case TIC6X_MNEM_shrmb: case TIC6X_MNEM_subc:
+    case TIC6X_MNEM_sadd2: case TIC6X_MNEM_ssub2: case TIC6X_MNEM_saddsu2:
+    case TIC6X_MNEM_avg2: case TIC6X_MNEM_min2: case TIC6X_MNEM_max2:
+    case TIC6X_MNEM_shr2: case TIC6X_MNEM_shru2: case TIC6X_MNEM_packh2:
+    case TIC6X_MNEM_packl4: case TIC6X_MNEM_packh4:
+    case TIC6X_MNEM_spack2: case TIC6X_MNEM_spacku4:
+    case TIC6X_MNEM_xpnd2: case TIC6X_MNEM_xpnd4: case TIC6X_MNEM_unpklu4:
+    case TIC6X_MNEM_add4: case TIC6X_MNEM_sub4: case TIC6X_MNEM_saddu4:
+    case TIC6X_MNEM_subabs4: case TIC6X_MNEM_minu4: case TIC6X_MNEM_maxu4:
+    case TIC6X_MNEM_avgu4:
+    case TIC6X_MNEM_cmpeq2: case TIC6X_MNEM_cmpgt2:
+    case TIC6X_MNEM_cmpeq4: case TIC6X_MNEM_cmpgtu4:
+    case TIC6X_MNEM_mpyi: case TIC6X_MNEM_mpyhi: case TIC6X_MNEM_mpyli:
+    case TIC6X_MNEM_mpylshu: case TIC6X_MNEM_mpyluhs:
+    case TIC6X_MNEM_mpyhuls: case TIC6X_MNEM_mpyhslu:
+    case TIC6X_MNEM_mpylhu: case TIC6X_MNEM_mpyhlu:
+    case TIC6X_MNEM_mpyhsu: case TIC6X_MNEM_mpyhus:
+    case TIC6X_MNEM_smpylh: case TIC6X_MNEM_smpyhl:
+    case TIC6X_MNEM_dotp2: case TIC6X_MNEM_dotpn2:
+    case TIC6X_MNEM_dotprsu2: case TIC6X_MNEM_dotpnrsu2:
+    case TIC6X_MNEM_dotpu4: case TIC6X_MNEM_dotpsu4:
+    case TIC6X_MNEM_gmpy4:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool routed_alu2_wide(uint16_t m)
+{
+    switch (m) {
+    case TIC6X_MNEM_mpyid: case TIC6X_MNEM_mpy32u:
+    case TIC6X_MNEM_mpy32su: case TIC6X_MNEM_mpy32us:
+    case TIC6X_MNEM_mpy2: case TIC6X_MNEM_smpy2:
+    case TIC6X_MNEM_mpyu4: case TIC6X_MNEM_mpysu4:
+    case TIC6X_MNEM_cmpy: case TIC6X_MNEM_cmpyr1:
+    case TIC6X_MNEM_addsub: case TIC6X_MNEM_addsub2:
+    case TIC6X_MNEM_saddsub: case TIC6X_MNEM_saddsub2:
+    case TIC6X_MNEM_dmv:
+    case TIC6X_MNEM_ddotp4: case TIC6X_MNEM_ddotpl2:
+    case TIC6X_MNEM_ddotpl2r:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* ------------------------------------------------------ one instruction */
 
 static int reg_of(uint32_t side, uint32_t num)
@@ -353,7 +443,147 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
     s = field_present(f, TIC6X_FLD_s) ? field_get(f, TIC6X_FLD_s, insn) : 0;
     x = field_present(f, TIC6X_FLD_x) ? field_get(f, TIC6X_FLD_x, insn) : 0;
 
+    /*
+     * The routed groups first: they all take the same operand shape and
+     * differ only in which helper case runs, so there is nothing to say
+     * about them one at a time.
+     */
+    if (routed_alu2(op->mnem)) {
+        int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
+        int src2 = reg_of(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 a = src1_value(f, op, insn, s);
+        TCGv_i32 v = tcg_temp_new_i32();
+
+        gen_helper_alu2(v, tcg_env, tcg_constant_i32(op->mnem), a,
+                        cpu_gpr[src2]);
+        wb_pred(dc, pred, dst, v);
+        return cycles;
+    }
+    if (routed_alu2_wide(op->mnem)) {
+        uint32_t dstn = field_get(f, TIC6X_FLD_dst, insn);
+        int src2 = reg_of(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 a = src1_value(f, op, insn, s);
+        TCGv_i64 v = tcg_temp_new_i64();
+
+        gen_helper_alu2_wide(v, tcg_env, tcg_constant_i32(op->mnem), a,
+                             cpu_gpr[src2]);
+        pair_set(dc, pred, s, dstn, v);
+        return cycles;
+    }
+
     switch (op->mnem) {
+    case TIC6X_MNEM_adddp:
+    case TIC6X_MNEM_subdp:
+    case TIC6X_MNEM_mpydp:
+    case TIC6X_MNEM_absdp:
+    case TIC6X_MNEM_rcpdp:
+    case TIC6X_MNEM_rsqrdp: {
+        /* Both operands and the result are register pairs. */
+        uint32_t dstn = field_get(f, TIC6X_FLD_dst, insn);
+        TCGv_i64 a = pair_get(s, field_get(f, TIC6X_FLD_src1, insn));
+        TCGv_i64 b = pair_get(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i64 v = tcg_temp_new_i64();
+
+        gen_helper_dp2(v, tcg_env, tcg_constant_i32(op->mnem), a, b);
+        pair_set(dc, pred, s, dstn, v);
+        break;
+    }
+
+    case TIC6X_MNEM_cmpeqdp:
+    case TIC6X_MNEM_cmpgtdp:
+    case TIC6X_MNEM_cmpltdp: {
+        /* Two pairs in, a one-or-zero flag out. */
+        int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
+        TCGv_i64 a = pair_get(s, field_get(f, TIC6X_FLD_src1, insn));
+        TCGv_i64 b = pair_get(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 v = tcg_temp_new_i32();
+
+        gen_helper_dp_cmp(v, tcg_env, tcg_constant_i32(op->mnem), a, b);
+        wb_pred(dc, pred, dst, v);
+        break;
+    }
+
+    case TIC6X_MNEM_mpyspdp: {
+        /* A single times a double, into a double. */
+        uint32_t dstn = field_get(f, TIC6X_FLD_dst, insn);
+        int src1 = reg_of(s, field_get(f, TIC6X_FLD_src1, insn));
+        TCGv_i64 b = pair_get(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i64 v = tcg_temp_new_i64();
+
+        gen_helper_spdp2(v, tcg_env, tcg_constant_i32(op->mnem),
+                         cpu_gpr[src1], b);
+        pair_set(dc, pred, s, dstn, v);
+        break;
+    }
+
+    case TIC6X_MNEM_mpysp2dp: {
+        /* Two singles, into a double. */
+        uint32_t dstn = field_get(f, TIC6X_FLD_dst, insn);
+        int src1 = reg_of(s, field_get(f, TIC6X_FLD_src1, insn));
+        int src2 = reg_of(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i64 v = tcg_temp_new_i64();
+
+        gen_helper_sp2dp(v, tcg_env, tcg_constant_i32(op->mnem),
+                         cpu_gpr[src1], cpu_gpr[src2]);
+        pair_set(dc, pred, s, dstn, v);
+        break;
+    }
+
+    case TIC6X_MNEM_spint:
+    case TIC6X_MNEM_sptrunc:
+    case TIC6X_MNEM_intsp:
+    case TIC6X_MNEM_intspu:
+    case TIC6X_MNEM_rsqrsp:
+    case TIC6X_MNEM_rcpsp: {
+        int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
+        int src2 = reg_of(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 v = tcg_temp_new_i32();
+
+        gen_helper_sp1(v, tcg_env, tcg_constant_i32(op->mnem),
+                       cpu_gpr[src2]);
+        wb_pred(dc, pred, dst, v);
+        break;
+    }
+
+    case TIC6X_MNEM_dpsp:
+    case TIC6X_MNEM_dpint:
+    case TIC6X_MNEM_dptrunc: {
+        /* A pair in, a single register out. */
+        int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
+        TCGv_i64 b = pair_get(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 v = tcg_temp_new_i32();
+
+        gen_helper_dp_to_w(v, tcg_env, tcg_constant_i32(op->mnem), b);
+        wb_pred(dc, pred, dst, v);
+        break;
+    }
+
+    case TIC6X_MNEM_spdp:
+    case TIC6X_MNEM_intdp:
+    case TIC6X_MNEM_intdpu: {
+        /* A single register in, a pair out. */
+        uint32_t dstn = field_get(f, TIC6X_FLD_dst, insn);
+        int src2 = reg_of(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i64 v = tcg_temp_new_i64();
+
+        gen_helper_w_to_dp(v, tcg_env, tcg_constant_i32(op->mnem),
+                           cpu_gpr[src2]);
+        pair_set(dc, pred, s, dstn, v);
+        break;
+    }
+
+    case TIC6X_MNEM_neg:
+    case TIC6X_MNEM_not:
+    case TIC6X_MNEM_abs: {
+        int dst = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
+        int src2 = reg_of(s ^ x, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 v = tcg_temp_new_i32();
+
+        gen_helper_alu1(v, tcg_constant_i32(op->mnem), cpu_gpr[src2]);
+        wb_pred(dc, pred, dst, v);
+        break;
+    }
+
     case TIC6X_MNEM_nop: {
         /*
          * NOP n idles for n cycles. Nothing here models cycles, but the
@@ -705,6 +935,34 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
         break;
     }
 
+    case TIC6X_MNEM_cmtl: {
+        /*
+         * Commit to memory and load - an atomic read for the shared-memory
+         * protocol on parts that have one. With no second master inside this
+         * model there is nothing to arbitrate against, so it is an ordinary
+         * doubleword load; the linked-store side would need modelling before
+         * that is more than a convenience.
+         */
+        uint32_t num = field_get(f, TIC6X_FLD_dst, insn);
+        int lo = reg_of(s, num & ~1u);
+        int hi = reg_of(s, (num & ~1u) | 1u);
+        int base = reg_of(s, field_get(f, TIC6X_FLD_src2, insn));
+        TCGv_i32 hiaddr = tcg_temp_new_i32();
+        TCGLabel *skip = NULL;
+
+        tcg_gen_addi_i32(hiaddr, cpu_gpr[base], 4);
+        if (pred) {
+            skip = gen_new_label();
+            tcg_gen_brcondi_i32(TCG_COND_EQ, pred, 0, skip);
+        }
+        tcg_gen_qemu_ld_i32(cpu_gpr[lo], cpu_gpr[base], 0, MO_LEUL);
+        tcg_gen_qemu_ld_i32(cpu_gpr[hi], hiaddr, 0, MO_LEUL);
+        if (skip) {
+            gen_set_label(skip);
+        }
+        break;
+    }
+
     case TIC6X_MNEM_ldnw:
     case TIC6X_MNEM_stnw: {
         /* Nonaligned word; the same as ldw and stw to a model that does not
@@ -966,6 +1224,88 @@ static int trans_one(DisasContext *dc, uint32_t insn, int bits,
             break;
         }
         wb_pred(dc, pred, dst, v);
+        break;
+    }
+
+    case TIC6X_MNEM_bdec:
+    case TIC6X_MNEM_bpos: {
+        /*
+         * Branch on the sign of a register, PC-relative by a ten-bit signed
+         * displacement. BDEC also decrements the register, unconditionally -
+         * the decrement happens whether or not the branch is taken, which is
+         * what makes it a loop counter.
+         */
+        int src = reg_of(s, field_get(f, TIC6X_FLD_src2, insn));
+        int32_t disp = (int32_t)(field_get(f, TIC6X_FLD_cst, insn) << 22) >> 22;
+        TCGv_i32 take = tcg_temp_new_i32();
+        TCGv_i32 target = tcg_temp_new_i32();
+
+        tcg_gen_setcondi_i32(TCG_COND_GE, take, cpu_gpr[src], 0);
+        if (pred) {
+            tcg_gen_and_i32(take, take, pred);
+        }
+        tcg_gen_movi_i32(target, dc->packet_pc + (disp << 2));
+        tcg_gen_movcond_i32(TCG_COND_NE, cpu_br_target, take,
+                            tcg_constant_i32(0), target, cpu_br_target);
+        tcg_gen_movcond_i32(TCG_COND_NE, cpu_br_taken, take,
+                            tcg_constant_i32(0), tcg_constant_i32(1),
+                            cpu_br_taken);
+        if (op->mnem == TIC6X_MNEM_bdec) {
+            TCGv_i32 dec = tcg_temp_new_i32();
+
+            tcg_gen_subi_i32(dec, cpu_gpr[src], 1);
+            wb_pred(dc, pred, src, dec);
+        }
+        dc->br_countdown = TIC6X_BRANCH_DELAY;
+        break;
+    }
+
+    case TIC6X_MNEM_callp: {
+        /*
+         * A call that saves its own return address, and - unlike B - has no
+         * visible delay slots: the instruction after it is the one that runs
+         * on return. So the link register gets the address just past this
+         * execute packet and the branch takes effect immediately.
+         */
+        int link = reg_of(s, field_get(f, TIC6X_FLD_dst, insn));
+        int32_t disp = (int32_t)(field_get(f, TIC6X_FLD_cst, insn) << 11) >> 11;
+        TCGv_i32 ret = tcg_temp_new_i32();
+
+        tcg_gen_movi_i32(ret, dc->base.pc_next);
+        wb_pred(dc, pred, link, ret);
+        tcg_gen_movi_i32(cpu_br_target, dc->packet_pc + (disp << 2));
+        tcg_gen_movi_i32(cpu_br_taken, 1);
+        dc->br_countdown = 0;       /* lands at the end of this packet */
+        break;
+    }
+
+    case TIC6X_MNEM_spmask:
+    case TIC6X_MNEM_spmaskr:
+    case TIC6X_MNEM_spkernel:
+    case TIC6X_MNEM_spkernelr:
+    case TIC6X_MNEM_sploop:
+    case TIC6X_MNEM_sploopd:
+    case TIC6X_MNEM_sploopw: {
+        /*
+         * The software-pipelined loop buffer, and the one thing here that is
+         * deliberately left unimplemented rather than approximated.
+         *
+         * SPLOOP does not mean "run this body ILC times". It loads the body
+         * into a buffer and replays it with a different set of stages active
+         * each iteration, so several iterations are in flight at once and an
+         * instruction's neighbours differ from one pass to the next. SPMASK
+         * then suppresses individual units within that. Executing the body
+         * serially gives the right answer only for loops that happen not to
+         * depend on the overlap, and the compiler emits SPLOOP precisely
+         * when it does depend on it.
+         *
+         * A wrong answer here would be wrong audio samples, quietly - the
+         * failure mode this model has been careful to avoid everywhere else.
+         * So it traps, and doing it properly means modelling the buffer and
+         * its stage predicates. 87 instructions in this firmware use it.
+         */
+        gen_helper_unimplemented(tcg_env, tcg_constant_i32(insn),
+                                 tcg_constant_i32(op->mnem));
         break;
     }
 

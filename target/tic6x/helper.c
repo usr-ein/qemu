@@ -14,6 +14,9 @@
 #include "accel/tcg/cpu-ldst.h"
 #include "system/runstate.h"
 #include "fpu/softfloat.h"
+#include "qemu/host-utils.h"
+
+#include "insn-mnem.h.inc"
 
 /*
  * Growing instruction coverage works the same way it did for the Blackfin:
@@ -131,6 +134,8 @@ uint32_t HELPER(cmpltsp)(CPUTIC6XState *env, uint32_t a, uint32_t b)
     return float32_lt(make_float32(a), make_float32(b),
                       sp_status(env)) ? 1 : 0;
 }
+
+#include "alu.c.inc"
 
 void tic6x_cpu_do_interrupt(CPUState *cs)
 {
