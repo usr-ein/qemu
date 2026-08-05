@@ -1485,6 +1485,7 @@ static void sh7764_ssi_rx_deliver(SH7764State *s)
     s->ssi_rx_len -= len;
     memmove(s->ssi_rx_buf, s->ssi_rx_buf + len, s->ssi_rx_len);
     s->ssi_rx_armed = false;
+    s->ssi_gui_answered = true;
     qemu_log_mask(LOG_UNIMP, "sh7764-ssi: delivered %u bytes to 0x%08x\n",
                   len, addr);
     /* Before the interrupt: the handler reads both in the same breath. */
@@ -1743,6 +1744,10 @@ static uint64_t sh7764_bank_read(void *opaque, hwaddr offset, unsigned size)
         return 0;
     }
     val = b->regs[idx];
+    if (b == &b->soc->gpio && offset == SH7764_PTDAT_C &&
+        b->soc->ssi_gui_answered) {
+        val |= SH7764_PTDAT_C_PTC2;
+    }
     trace_sh7764_bank_read(b->name, offset, val, size, sh7764_guest_pc());
     return val;
 }
@@ -2123,6 +2128,7 @@ static void sh7764_reset(DeviceState *dev)
         s->ssi_rx_armed = false;
         s->panel_rx_len = 0;
         s->panel_have_last = false;
+        s->ssi_gui_answered = false;
         sh7764_ssi_bank_reset(&s->ssi_a);
         sh7764_ssi_bank_reset(&s->ssi_b);
     }
